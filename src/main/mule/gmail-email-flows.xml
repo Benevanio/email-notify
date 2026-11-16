@@ -2,112 +2,107 @@
 
 <mule
     xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
     xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
         http://www.mulesoft.org/schema/mule/ee/core
         http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
     <!--
-        Fluxos de e-mail, thread e label. Todos somente leitura.
-        Entradas (vars): gmailQuery, pageSize, pageToken | messageId | threadId
+        E-mails monitorados (PostgreSQL). Entradas em vars.emailFilters:
+        emailId, category, urgencyLevel, sender, fromDate, toDate, cursor, unreadOnly, limit.
     -->
+    <sub-flow name="select-monitored-emails-flow">
 
-    <!-- Listagem com metadados: /emails, /emails/unread, /emails/search -->
-    <sub-flow name="list-emails-flow">
+        <db:select config-ref="Postgres_DB_Config" doc:name="Select Monitored Emails">
+            <db:sql><![CDATA[SELECT e.id,
+    e.gmail_message_id,
+    e.gmail_thread_id,
+    e.sender_email,
+    e.sender_domain,
+    e.sender_name,
+    e.subject,
+    e.snippet,
+    to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS received_at,
+    e.is_unread,
+    CAST(e.label_ids AS text) AS label_ids,
+    c.category,
+    c.urgency_level,
+    c.requires_action,
+    c.possible_action,
+    c.classification_reason,
+    c.classifier_version
+FROM emails e
+LEFT JOIN email_classifications c ON c.email_id = e.id AND c.classifier_version = 'heuristic-v1'
+WHERE (CAST(:emailId AS text) IS NULL OR CAST(e.id AS text) = CAST(:emailId AS text))
+  AND (CAST(:category AS text) IS NULL OR c.category = CAST(:category AS text))
+  AND (CAST(:urgencyLevel AS text) IS NULL OR c.urgency_level = CAST(:urgencyLevel AS text))
+  AND (CAST(:sender AS text) IS NULL OR e.sender_email = CAST(:sender AS text))
+  AND (CAST(:fromDate AS date) IS NULL OR CAST(e.received_at AT TIME ZONE 'America/Fortaleza' AS date) >= CAST(:fromDate AS date))
+  AND (CAST(:toDate AS date) IS NULL OR CAST(e.received_at AT TIME ZONE 'America/Fortaleza' AS date) <= CAST(:toDate AS date))
+  AND (CAST(:cursor AS timestamptz) IS NULL OR e.received_at < CAST(:cursor AS timestamptz))
+  AND (CAST(:unreadOnly AS boolean) = false OR e.is_unread = true)
+ORDER BY e.received_at DESC
+LIMIT CAST(:limit AS integer)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                emailId: vars.emailFilters.emailId,
+                category: vars.emailFilters.category,
+                urgencyLevel: vars.emailFilters.urgencyLevel,
+                sender: vars.emailFilters.sender,
+                fromDate: vars.emailFilters.fromDate,
+                toDate: vars.emailFilters.toDate,
+                cursor: vars.emailFilters.cursor,
+                unreadOnly: vars.emailFilters.unreadOnly default false,
+                limit: vars.emailFilters.limit default 20
+            }]]]></db:input-parameters>
+        </db:select>
 
-        <flow-ref
-            name="get-message-page-flow"
-            doc:name="Get Message Page"/>
+    </sub-flow>
 
-        <set-variable
-            variableName="nextPageToken"
-            value="#[payload.nextPageToken]"/>
+    <!-- GET /gmail/emails, /gmail/emails/unread, /gmail/emails/search -->
+    <sub-flow name="list-monitored-emails-flow">
 
-        <set-variable
-            variableName="resultSizeEstimate"
-            value="#[payload.resultSizeEstimate default 0]"/>
-
-        <set-variable
-            variableName="messageIds"
-            value="#[(payload.messages default []) map ((message) -> message.id)]"/>
-
-        <parallel-foreach
-            collection="#[vars.messageIds]"
-            maxConcurrency="${gmail.maxConcurrency}"
-            doc:name="Fetch Message Metadata">
-
-            <set-variable
-                variableName="messageId"
-                value="#[payload]"/>
-
-            <flow-ref
-                name="get-message-metadata-flow"
-                doc:name="Get Message Metadata"/>
-
-        </parallel-foreach>
-
-        <ee:transform doc:name="Normalize Messages">
-            <ee:message>
-                <ee:set-payload resource="dw/normalize-messages.dwl"/>
-            </ee:message>
-        </ee:transform>
+        <flow-ref name="select-monitored-emails-flow" doc:name="Select Emails"/>
 
         <ee:transform doc:name="Email Page">
             <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    emails: payload,
-    nextPageToken: vars.nextPageToken,
-    resultSizeEstimate: vars.resultSizeEstimate
-}
-                ]]></ee:set-payload>
+                <ee:set-payload resource="dw/email-page.dwl"/>
             </ee:message>
         </ee:transform>
 
     </sub-flow>
 
-    <!-- Detalhe de uma mensagem: /emails/{id} -->
-    <sub-flow name="get-email-detail-flow">
+    <!-- GET /gmail/emails/{id} -->
+    <sub-flow name="get-monitored-email-flow">
 
-        <flow-ref
-            name="get-message-full-flow"
-            doc:name="Get Full Message"/>
+        <flow-ref name="select-monitored-emails-flow" doc:name="Select Email"/>
 
-        <ee:transform doc:name="Email Detail">
+        <choice doc:name="Email Exists?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error
+                    type="RESOURCE:NOT_FOUND"
+                    description="E-mail monitorado não encontrado."/>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Email">
             <ee:message>
-                <ee:set-payload resource="dw/message-detail.dwl"/>
+                <ee:set-payload resource="dw/email-item.dwl"/>
             </ee:message>
         </ee:transform>
 
     </sub-flow>
 
-    <!-- Conversa completa: /threads/{id} -->
-    <sub-flow name="get-thread-flow">
-
-        <flow-ref
-            name="get-thread-metadata-flow"
-            doc:name="Get Thread"/>
-
-        <ee:transform doc:name="Thread Detail">
-            <ee:message>
-                <ee:set-payload resource="dw/thread-detail.dwl"/>
-            </ee:message>
-        </ee:transform>
-
-    </sub-flow>
-
-    <!-- Labels com contadores: /labels -->
+    <!-- GET /gmail/labels: somente leitura, com contadores via labels.get -->
     <sub-flow name="list-labels-flow">
 
-        <flow-ref
-            name="list-label-ids-flow"
-            doc:name="List Label Ids"/>
+        <flow-ref name="list-label-ids-flow" doc:name="List Label Ids"/>
 
         <set-variable
             variableName="labelIds"
@@ -122,9 +117,7 @@ output application/json
                 variableName="labelId"
                 value="#[payload]"/>
 
-            <flow-ref
-                name="get-label-flow"
-                doc:name="Get Label"/>
+            <flow-ref name="get-label-flow" doc:name="Get Label"/>
 
             <ee:transform doc:name="Label Summary">
                 <ee:message>
@@ -133,18 +126,6 @@ output application/json
             </ee:transform>
 
         </parallel-foreach>
-
-        <ee:transform doc:name="Label List">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    labels: payload
-}
-                ]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
 
     </sub-flow>
 

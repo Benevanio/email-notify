@@ -15,9 +15,9 @@
         http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
 
     <!--
-        Relatório de e-mails.
-        POST /reports/emails -> generate-email-report-flow (payload = corpo do pedido)
-        Job diário (scheduler)  -> daily-email-report-flow: gera o relatório, grava em disco e avisa no celular.
+        Relatório de e-mails (lido do Gmail, período e filtros do pedido).
+        POST /reports/emails -> generate-email-report-flow (payload = corpo do pedido).
+        Job diário -> daily-email-report-flow: gera, grava em disco e avisa pelo WhatsApp (template aprovado).
     -->
 
     <sub-flow name="generate-email-report-flow">
@@ -45,7 +45,6 @@
             variableName="reportRequest"
             value="#[payload.request]"/>
 
-        <!-- Consulta ao Gmail com margem de 1 dia de cada lado; o recorte exato é feito no DataWeave (fuso report.timezone) -->
         <set-variable
             variableName="gmailQuery"
             value="#[trim((vars.reportRequest.query default '') ++ ' after:' ++ (((vars.reportRequest.startDate as Date) - |P1D|) as String {format: 'yyyy/MM/dd'}) ++ ' before:' ++ (((vars.reportRequest.endDate as Date) + |P2D|) as String {format: 'yyyy/MM/dd'}))]"/>
@@ -115,10 +114,6 @@ output application/json
 
     </sub-flow>
 
-    <!--
-        Coleta recursiva de ids de mensagens, limitada por maxMessages e gmail.maxListPages.
-        Cada chamada busca uma página (no máximo o que falta para maxMessages) e só continua se houver nextPageToken.
-    -->
     <sub-flow name="collect-message-ids-flow">
 
         <choice doc:name="More Pages Needed?">
@@ -153,7 +148,6 @@ output application/json
 
     </sub-flow>
 
-    <!-- Job diário: últimas 24 h (ontem até hoje, fuso report.timezone) -->
     <flow name="daily-email-report-flow">
 
         <scheduler doc:name="Daily Report Schedule">
@@ -189,45 +183,31 @@ output application/json
 
         <set-payload value="#[vars.dailyReport]"/>
 
-        <ee:transform doc:name="Notification Text">
+        <ee:transform doc:name="Notification Parameters">
             <ee:message>
                 <ee:set-payload resource="dw/build-report-notification.dwl"/>
             </ee:message>
         </ee:transform>
 
         <set-variable
-            variableName="notificationTitle"
-            value="Relatorio Gmail gerado"/>
-
-        <set-variable
-            variableName="notificationMessage"
+            variableName="waParameters"
             value="#[payload]"/>
 
+        <set-variable
+            variableName="waTemplateName"
+            value="#[p('whatsapp.dailyTemplateName')]"/>
+
         <flow-ref
-            name="send-phone-notification-flow"
-            doc:name="Notify Phone"/>
+            name="send-whatsapp-template-flow"
+            doc:name="Notify Daily Report"/>
 
         <error-handler>
             <on-error-continue
                 type="ANY"
                 doc:name="Daily Report Failed">
-
                 <logger
                     level="ERROR"
-                    message="#['Falha no relatório diário. correlationId=' ++ vars.correlationId ++ ' erro=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier)]"/>
-
-                <set-variable
-                    variableName="notificationTitle"
-                    value="Falha no relatorio Gmail"/>
-
-                <set-variable
-                    variableName="notificationMessage"
-                    value="#['Nao foi possivel gerar o relatorio diario (' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier) ++ '). Consulte os logs.']"/>
-
-                <flow-ref
-                    name="send-phone-notification-flow"
-                    doc:name="Notify Failure"/>
-
+                    message="#['Falha no relatório diário. correlationId=' ++ (vars.correlationId default '') ++ ' erro=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier)]"/>
             </on-error-continue>
         </error-handler>
 

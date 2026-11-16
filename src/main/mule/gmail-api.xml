@@ -14,7 +14,6 @@
         http://www.mulesoft.org/schema/mule/mule-apikit
         http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd">
 
-    <!-- Entrada única da API. O status HTTP vem de vars.httpStatus (definido pelo global-error-handler em erros). -->
     <flow name="gmail-intelligence-api-main">
 
         <http:listener
@@ -46,12 +45,9 @@
 
     </flow>
 
-    <!-- Implementações dos endpoints do RAML (nomes gerados pelo APIkit: método:\caminho:config) -->
-
     <flow name="get:\health:gmail-intelligence-api-config">
         <set-payload
             mimeType="application/json"
-            doc:name="Health Response"
             value="#[{
                 status: 'UP',
                 service: p('app.name'),
@@ -60,38 +56,71 @@
             }]"/>
     </flow>
 
-    <flow name="get:\emails:gmail-intelligence-api-config">
-        <set-variable variableName="gmailQuery" value="#[attributes.queryParams.q default p('gmail.defaultQuery')]"/>
-        <set-variable variableName="pageSize" value="#[(attributes.queryParams.maxResults default p('gmail.defaultMaxResults')) as Number]"/>
-        <set-variable variableName="pageToken" value="#[attributes.queryParams.pageToken]"/>
-        <flow-ref name="list-emails-flow" doc:name="List Emails"/>
+    <flow name="get:\status:gmail-intelligence-api-config">
+        <flow-ref name="system-status-flow" doc:name="System Status"/>
     </flow>
 
-    <flow name="get:\emails\unread:gmail-intelligence-api-config">
-        <set-variable variableName="gmailQuery" value="is:unread"/>
-        <set-variable variableName="pageSize" value="#[(attributes.queryParams.maxResults default p('gmail.defaultMaxResults')) as Number]"/>
-        <set-variable variableName="pageToken" value="#[attributes.queryParams.pageToken]"/>
-        <flow-ref name="list-emails-flow" doc:name="List Unread Emails"/>
+    <flow name="get:\gmail\status:gmail-intelligence-api-config">
+        <flow-ref name="gmail-status-flow" doc:name="Gmail Status"/>
     </flow>
 
-    <flow name="get:\emails\search:gmail-intelligence-api-config">
-        <set-variable variableName="gmailQuery" value="#[attributes.queryParams.q]"/>
-        <set-variable variableName="pageSize" value="#[(attributes.queryParams.maxResults default p('gmail.defaultMaxResults')) as Number]"/>
-        <set-variable variableName="pageToken" value="#[attributes.queryParams.pageToken]"/>
-        <flow-ref name="list-emails-flow" doc:name="Search Emails"/>
+    <flow name="get:\gmail\authorize:gmail-intelligence-api-config">
+        <flow-ref name="build-authorization-url-flow" doc:name="Authorization URL"/>
     </flow>
 
-    <flow name="get:\emails\(id):gmail-intelligence-api-config">
-        <set-variable variableName="messageId" value="#[attributes.uriParams.id]"/>
-        <flow-ref name="get-email-detail-flow" doc:name="Get Email"/>
+    <flow name="get:\gmail\callback:gmail-intelligence-api-config">
+        <set-variable variableName="oauthCode" value="#[attributes.queryParams.code]"/>
+        <set-variable variableName="oauthState" value="#[attributes.queryParams.state]"/>
+        <set-variable variableName="oauthError" value="#[attributes.queryParams.error]"/>
+        <flow-ref name="handle-oauth-callback-flow" doc:name="OAuth Callback"/>
     </flow>
 
-    <flow name="get:\threads\(id):gmail-intelligence-api-config">
-        <set-variable variableName="threadId" value="#[attributes.uriParams.id]"/>
-        <flow-ref name="get-thread-flow" doc:name="Get Thread"/>
+    <flow name="post:\gmail\disconnect:gmail-intelligence-api-config">
+        <flow-ref name="disconnect-gmail-flow" doc:name="Disconnect Gmail"/>
+        <flow-ref name="gmail-status-flow" doc:name="Gmail Status"/>
     </flow>
 
-    <flow name="get:\labels:gmail-intelligence-api-config">
+    <flow name="post:\gmail\sync:gmail-intelligence-api-config">
+        <flow-ref name="request-sync-flow" doc:name="Request Sync"/>
+        <set-variable variableName="httpStatus" value="#[202]"/>
+        <set-payload value="#[null]"/>
+    </flow>
+
+    <flow name="get:\gmail\emails:gmail-intelligence-api-config">
+        <set-variable
+            variableName="emailFilters"
+            value="#[{
+                category: attributes.queryParams.category,
+                urgencyLevel: attributes.queryParams.urgencyLevel,
+                sender: attributes.queryParams.sender,
+                fromDate: attributes.queryParams.from,
+                toDate: attributes.queryParams.to,
+                cursor: attributes.queryParams.cursor,
+                unreadOnly: false,
+                limit: (attributes.queryParams.limit default 20) as Number
+            }]"/>
+        <flow-ref name="list-monitored-emails-flow" doc:name="List Emails"/>
+    </flow>
+
+    <flow name="get:\gmail\emails\unread:gmail-intelligence-api-config">
+        <set-variable
+            variableName="emailFilters"
+            value="#[{
+                cursor: attributes.queryParams.cursor,
+                unreadOnly: true,
+                limit: (attributes.queryParams.limit default 20) as Number
+            }]"/>
+        <flow-ref name="list-monitored-emails-flow" doc:name="List Unread Emails"/>
+    </flow>
+
+    <flow name="get:\gmail\emails\(id):gmail-intelligence-api-config">
+        <set-variable
+            variableName="emailFilters"
+            value="#[{emailId: attributes.uriParams.id, limit: 1}]"/>
+        <flow-ref name="get-monitored-email-flow" doc:name="Get Email"/>
+    </flow>
+
+    <flow name="get:\gmail\labels:gmail-intelligence-api-config">
         <flow-ref name="list-labels-flow" doc:name="List Labels"/>
     </flow>
 
@@ -99,15 +128,75 @@
         <flow-ref name="generate-email-report-flow" doc:name="Generate Report"/>
     </flow>
 
-    <flow name="get:\auth\google:gmail-intelligence-api-config">
-        <flow-ref name="build-authorization-url-flow" doc:name="Authorization URL"/>
+    <flow name="get:\reports\summary:gmail-intelligence-api-config">
+        <flow-ref name="summary-flow" doc:name="Summary"/>
     </flow>
 
-    <flow name="get:\auth\google\callback:gmail-intelligence-api-config">
-        <set-variable variableName="oauthCode" value="#[attributes.queryParams.code]"/>
-        <set-variable variableName="oauthState" value="#[attributes.queryParams.state]"/>
-        <set-variable variableName="oauthError" value="#[attributes.queryParams.error]"/>
-        <flow-ref name="handle-oauth-callback-flow" doc:name="OAuth Callback"/>
+    <flow name="get:\notifications:gmail-intelligence-api-config">
+        <set-variable
+            variableName="notificationFilters"
+            value="#[{
+                status: attributes.queryParams.status,
+                cursor: attributes.queryParams.cursor,
+                limit: (attributes.queryParams.limit default 20) as Number
+            }]"/>
+        <flow-ref name="list-notifications-flow" doc:name="List Notifications"/>
+    </flow>
+
+    <flow name="get:\notifications\(id):gmail-intelligence-api-config">
+        <set-variable variableName="notificationId" value="#[attributes.uriParams.id]"/>
+        <flow-ref name="get-notification-flow" doc:name="Get Notification"/>
+    </flow>
+
+    <flow name="post:\notifications\(id)\retry:gmail-intelligence-api-config">
+        <set-variable variableName="notificationId" value="#[attributes.uriParams.id]"/>
+        <flow-ref name="retry-notification-flow" doc:name="Retry Notification"/>
+        <set-variable variableName="httpStatus" value="#[202]"/>
+        <set-payload value="#[null]"/>
+    </flow>
+
+    <flow name="get:\rules:gmail-intelligence-api-config">
+        <flow-ref name="list-rules-flow" doc:name="List Rules"/>
+    </flow>
+
+    <flow name="post:\rules:gmail-intelligence-api-config">
+        <flow-ref name="create-rule-flow" doc:name="Create Rule"/>
+        <set-variable variableName="httpStatus" value="#[201]"/>
+    </flow>
+
+    <flow name="get:\rules\(id):gmail-intelligence-api-config">
+        <set-variable variableName="ruleId" value="#[attributes.uriParams.id]"/>
+        <flow-ref name="get-rule-flow" doc:name="Get Rule"/>
+    </flow>
+
+    <flow name="put:\rules\(id):gmail-intelligence-api-config">
+        <set-variable variableName="ruleId" value="#[attributes.uriParams.id]"/>
+        <flow-ref name="update-rule-flow" doc:name="Update Rule"/>
+    </flow>
+
+    <flow name="delete:\rules\(id):gmail-intelligence-api-config">
+        <set-variable variableName="ruleId" value="#[attributes.uriParams.id]"/>
+        <flow-ref name="delete-rule-flow" doc:name="Delete Rule"/>
+        <set-variable variableName="httpStatus" value="#[204]"/>
+    </flow>
+
+    <flow name="post:\webhooks\google-pubsub:gmail-intelligence-api-config">
+        <set-variable variableName="authHeader" value="#[attributes.headers.authorization]"/>
+        <flow-ref name="pubsub-webhook-flow" doc:name="Pub/Sub Webhook"/>
+        <set-variable variableName="httpStatus" value="#[204]"/>
+        <set-payload value="#[null]"/>
+    </flow>
+
+    <flow name="get:\webhooks\whatsapp:gmail-intelligence-api-config">
+        <set-variable variableName="hubMode" value="#[attributes.queryParams.'hub.mode']"/>
+        <set-variable variableName="hubVerifyToken" value="#[attributes.queryParams.'hub.verify_token']"/>
+        <set-variable variableName="hubChallenge" value="#[attributes.queryParams.'hub.challenge']"/>
+        <flow-ref name="whatsapp-verify-flow" doc:name="WhatsApp Verify"/>
+    </flow>
+
+    <flow name="post:\webhooks\whatsapp:gmail-intelligence-api-config">
+        <set-variable variableName="signatureHeader" value="#[attributes.headers.'x-hub-signature-256']"/>
+        <flow-ref name="whatsapp-status-flow" doc:name="WhatsApp Status"/>
     </flow>
 
 </mule>

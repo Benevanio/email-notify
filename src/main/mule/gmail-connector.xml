@@ -48,7 +48,7 @@
 
                     <http:request
                         config-ref="Gmail_HTTP_Request_Config"
-                        method="GET"
+                        method="#[vars.gmailMethod default 'GET']"
                         path="#[vars.gmailPath]"
                         doc:name="Gmail GET">
 
@@ -58,6 +58,7 @@
                         }]]]></http:headers>
 
                         <http:query-params><![CDATA[#[(vars.gmailQueryParams default {}) filterObject ((value) -> value != null)]]]></http:query-params>
+                        <http:body><![CDATA[#[vars.gmailBody]]]></http:body>
 
                     </http:request>
 
@@ -142,6 +143,7 @@
     <!-- Monta as chamadas genéricas usadas pelos fluxos de e-mail, thread e label -->
 
     <sub-flow name="get-message-page-flow">
+        <set-variable variableName="gmailMethod" value="GET"/>
         <set-variable variableName="gmailPath" value="/messages"/>
         <set-variable
             variableName="gmailQueryParams"
@@ -150,30 +152,21 @@
     </sub-flow>
 
     <sub-flow name="get-message-metadata-flow">
+        <set-variable variableName="gmailMethod" value="GET"/>
         <set-variable variableName="gmailPath" value="#['/messages/' ++ vars.messageId]"/>
         <set-variable variableName="gmailQueryParams" value="#[{format: 'metadata'}]"/>
         <flow-ref name="call-gmail-api-flow" doc:name="Get Message Metadata"/>
     </sub-flow>
 
-    <sub-flow name="get-message-full-flow">
-        <set-variable variableName="gmailPath" value="#['/messages/' ++ vars.messageId]"/>
-        <set-variable variableName="gmailQueryParams" value="#[{format: 'full'}]"/>
-        <flow-ref name="call-gmail-api-flow" doc:name="Get Message Full"/>
-    </sub-flow>
-
-    <sub-flow name="get-thread-metadata-flow">
-        <set-variable variableName="gmailPath" value="#['/threads/' ++ vars.threadId]"/>
-        <set-variable variableName="gmailQueryParams" value="#[{format: 'metadata'}]"/>
-        <flow-ref name="call-gmail-api-flow" doc:name="Get Thread Metadata"/>
-    </sub-flow>
-
     <sub-flow name="list-label-ids-flow">
+        <set-variable variableName="gmailMethod" value="GET"/>
         <set-variable variableName="gmailPath" value="/labels"/>
         <set-variable variableName="gmailQueryParams" value="#[{}]"/>
         <flow-ref name="call-gmail-api-flow" doc:name="List Labels"/>
     </sub-flow>
 
     <sub-flow name="get-label-flow">
+        <set-variable variableName="gmailMethod" value="GET"/>
         <set-variable variableName="gmailPath" value="#['/labels/' ++ vars.labelId]"/>
         <set-variable variableName="gmailQueryParams" value="#[{}]"/>
         <flow-ref name="call-gmail-api-flow" doc:name="Get Label"/>

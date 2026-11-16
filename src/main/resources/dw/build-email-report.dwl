@@ -1,18 +1,6 @@
 %dw 2.0
 output application/json
 
-/**
- * Constrói o relatório consolidado de e-mails.
- *
- * Entrada (payload):
- *   request:    { startDate, endDate, groupBy, includeRead, includeUnread, maxEmails, query }  (datas yyyy-MM-dd, validadas)
- *   messages:   [ mensagens normalizadas pelo messageNormalizer ]
- *   collection: { truncated: Boolean }
- *
- * Os filtros de data e de leitura são aplicados aqui, de fato, antes de qualquer agregação.
- * Não há corpos de e-mail na saída. Classificações são heurísticas.
- */
-
 var req = payload.request
 var tz = p('report.timezone')
 var grouping = req.groupBy default "day"
@@ -56,31 +44,33 @@ var volume = (analyzed groupBy ((m) -> periodOf(m))) pluck ((items, period) -> {
 }) orderBy ((v) -> v.period)
 
 var importantEmails = analyzed
-    filter ((m) -> m.priority == "CRITICAL" or m.priority == "HIGH")
+    filter ((m) -> m.classification.urgencyLevel == "HIGH" or m.classification.urgencyLevel == "CRITICAL")
     map ((m) -> {
         emailId: m.id,
         subject: m.subject,
         sender: m.senderEmail,
         localDate: m.localDate,
-        priority: m.priority,
-        reasons: m.importanceReasons
+        urgencyLevel: m.classification.urgencyLevel,
+        reason: m.classification.classificationReason
     })
 
 var pendingActions = analyzed
-    filter ((m) -> not isEmpty(m.pendingKinds))
+    filter ((m) -> m.classification.requiresAction)
     map ((m) -> {
         emailId: m.id,
         subject: m.subject,
         sender: m.senderEmail,
         localDate: m.localDate,
-        category: m.category,
-        kinds: m.pendingKinds
+        category: m.classification.category,
+        possibleAction: m.classification.possibleAction
     })
 
 var categoryCounts = {
-    COBRANCA: sizeOf(analyzed filter ((m) -> m.category == "COBRANCA")),
-    VAGA: sizeOf(analyzed filter ((m) -> m.category == "VAGA")),
-    NORMAL: sizeOf(analyzed filter ((m) -> m.category == "NORMAL"))
+    URGENTE: sizeOf(analyzed filter ((m) -> m.classification.category == "URGENTE")),
+    IMPORTANTE: sizeOf(analyzed filter ((m) -> m.classification.category == "IMPORTANTE")),
+    ACAO_NECESSARIA: sizeOf(analyzed filter ((m) -> m.classification.category == "ACAO_NECESSARIA")),
+    INFORMATIVO: sizeOf(analyzed filter ((m) -> m.classification.category == "INFORMATIVO")),
+    BAIXA_PRIORIDADE: sizeOf(analyzed filter ((m) -> m.classification.category == "BAIXA_PRIORIDADE"))
 }
 
 var unreadCount = sizeOf(analyzed filter ((m) -> m.unread))
@@ -90,21 +80,16 @@ var executiveSummary =
     "Foram analisados " ++ (sizeOf(analyzed) as String)
     ++ " e-mails de " ++ startDate ++ " a " ++ endDate ++ ". "
     ++ (unreadCount as String) ++ " não lidos. "
-    ++ "Categorias sugeridas: " ++ (categoryCounts.COBRANCA as String) ++ " de cobrança, "
-    ++ (categoryCounts.VAGA as String) ++ " de vagas e "
-    ++ (categoryCounts.NORMAL as String) ++ " gerais. "
-    ++ (sizeOf(importantEmails) as String) ++ " mensagens potencialmente importantes e "
-    ++ (sizeOf(pendingActions) as String) ++ " com possíveis ações pendentes (heurística, a confirmar)."
+    ++ (categoryCounts.URGENTE as String) ++ " urgentes, "
+    ++ (sizeOf(importantEmails) as String) ++ " de alta prioridade e "
+    ++ (sizeOf(pendingActions) as String) ++ " com possível ação (heurística, a confirmar)."
 
 ---
 {
     reportId: uuid(),
     generatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX", timezone: tz},
     timezone: tz,
-    period: {
-        startDate: startDate,
-        endDate: endDate
-    },
+    period: {startDate: startDate, endDate: endDate},
     filters: {
         includeRead: includeRead,
         includeUnread: includeUnread,

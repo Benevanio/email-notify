@@ -3,6 +3,7 @@
 <mule
     xmlns:http="http://www.mulesoft.org/schema/mule/http"
     xmlns:os="http://www.mulesoft.org/schema/mule/os"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
     xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
     xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
@@ -14,16 +15,11 @@
         http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/os
         http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
         http://www.mulesoft.org/schema/mule/ee/core
         http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-    <!--
-        OAuth 2.0 (Google) — escopo somente leitura.
-        Registro do token: Google_Token_Store, chave "google-oauth-tokens" = { refreshToken, accessToken, expiresAt(ms) }.
-        Nenhum token é devolvido em respostas HTTP, logs ou mensagens de erro.
-    -->
-
-    <!-- GET /auth/google: gera a URL de consentimento e um state anti-CSRF -->
     <sub-flow name="build-authorization-url-flow">
 
         <set-variable
@@ -48,7 +44,6 @@
 
     </sub-flow>
 
-    <!-- GET /auth/google/callback: valida o state, troca o code por tokens e os armazena -->
     <sub-flow name="handle-oauth-callback-flow">
 
         <choice doc:name="Check Callback Parameters">
@@ -74,7 +69,7 @@
                 <on-error-propagate type="OS:KEY_NOT_FOUND">
                     <raise-error
                         type="AUTH:INVALID_STATE"
-                        description="State inválido ou expirado. Gere uma nova URL em /auth/google."/>
+                        description="State inválido ou expirado. Gere uma nova URL em /gmail/authorize."/>
                 </on-error-propagate>
             </error-handler>
         </try>
@@ -118,82 +113,204 @@
             </when>
         </choice>
 
-        <set-payload
-            value="#[{
-                refreshToken: payload.refresh_token,
-                accessToken: payload.access_token,
-                expiresAt: (now() as Number {unit: 'milliseconds'}) + (((payload.expires_in default 3600) as Number) * 1000)
-            }]"
-            doc:name="Token Record"/>
+        <set-variable variableName="plainRefreshToken" value="#[payload.refresh_token]"/>
+        <set-variable variableName="plainAccessToken" value="#[payload.access_token]"/>
+        <set-variable variableName="expiresIn" value="#[(payload.expires_in default 3600) as Number]"/>
 
-        <os:store
-            key="google-oauth-tokens"
-            objectStore="Google_Token_Store"
-            doc:name="Store Google Tokens"/>
+        <http:request
+            config-ref="Gmail_HTTP_Request_Config"
+            method="GET"
+            path="/profile"
+            doc:name="Gmail Profile">
+            <http:headers><![CDATA[#[{
+                Authorization: 'Bearer ' ++ vars.plainAccessToken,
+                Accept: 'application/json'
+            }]]]></http:headers>
+        </http:request>
+
+        <set-variable variableName="accountEmail" value="#[lower(payload.emailAddress)]"/>
+        <set-variable variableName="historyId" value="#[payload.historyId as String]"/>
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Upsert Gmail Account">
+            <db:sql><![CDATA[INSERT INTO integration_accounts (provider, external_account, status, granted_scope)
+VALUES ('GMAIL', :account, 'CONNECTED', :scope)
+ON CONFLICT (provider, external_account)
+DO UPDATE SET status = 'CONNECTED', granted_scope = EXCLUDED.granted_scope, updated_at = now()]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                account: vars.accountEmail,
+                scope: p('google.scope')
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Read Gmail Account Id">
+            <db:sql>SELECT id FROM integration_accounts WHERE provider = 'GMAIL' AND external_account = :account</db:sql>
+            <db:input-parameters><![CDATA[#[{account: vars.accountEmail}]]]></db:input-parameters>
+        </db:select>
+
+        <set-variable variableName="accountId" value="#[payload[0].id]"/>
+
+        <ee:transform doc:name="Encrypt Tokens">
+            <ee:message>
+                <ee:set-payload value="#[payload]"/>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="encryptedRefresh" resource="dw/encrypt-refresh-token.dwl"/>
+                <ee:set-variable variableName="encryptedAccess" resource="dw/encrypt-access-token.dwl"/>
+            </ee:variables>
+        </ee:transform>
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Upsert OAuth Tokens">
+            <db:sql><![CDATA[INSERT INTO oauth_tokens (integration_account_id, refresh_token_encrypted, access_token_encrypted, access_token_expires_at, encryption_key_version)
+VALUES (CAST(:accountId AS uuid), :refreshToken, :accessToken, now() + (CAST(:expiresIn AS integer) * interval '1 second'), 1)
+ON CONFLICT (integration_account_id)
+DO UPDATE SET refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
+    access_token_encrypted = EXCLUDED.access_token_encrypted,
+    access_token_expires_at = EXCLUDED.access_token_expires_at,
+    revoked_at = NULL,
+    updated_at = now()]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                accountId: vars.accountId,
+                refreshToken: vars.encryptedRefresh,
+                accessToken: vars.encryptedAccess,
+                expiresIn: vars.expiresIn
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Upsert Sync State">
+            <db:sql><![CDATA[INSERT INTO sync_state (integration_account_id, history_id, updated_at)
+VALUES (CAST(:accountId AS uuid), :historyId, now())
+ON CONFLICT (integration_account_id)
+DO UPDATE SET history_id = EXCLUDED.history_id, updated_at = now()]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                accountId: vars.accountId,
+                historyId: vars.historyId
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <flow-ref name="register-gmail-watch-flow" doc:name="Register Gmail Watch"/>
 
         <set-payload
             mimeType="application/json"
             value="#[{
-                status: 'AUTHORIZED',
-                scope: p('google.scope'),
-                message: 'Autorização concluída. A API já pode consultar o Gmail em modo somente leitura.'
+                status: 'CONNECTED',
+                account: vars.accountEmail,
+                scope: p('google.scope')
             }]"
             doc:name="Authorization Status"/>
 
     </sub-flow>
 
-    <!-- Lê o registro de tokens. Sem registro, a API pede nova autorização. -->
-    <sub-flow name="load-google-token-record-flow">
+    <sub-flow name="register-gmail-watch-flow">
 
-        <try doc:name="Load Token Record">
-            <os:retrieve
-                key="google-oauth-tokens"
-                objectStore="Google_Token_Store"
-                target="tokenRecord"
-                doc:name="Retrieve Google Tokens"/>
-            <error-handler>
-                <on-error-propagate type="OS:KEY_NOT_FOUND">
-                    <raise-error
-                        type="AUTH:NOT_AUTHORIZED"
-                        description="Gmail não autorizado. Acesse /auth/google para autorizar a aplicação."/>
-                </on-error-propagate>
-            </error-handler>
-        </try>
+        <set-variable variableName="gmailMethod" value="POST"/>
+        <set-variable variableName="gmailPath" value="/watch"/>
+        <set-variable variableName="gmailQueryParams" value="#[{}]"/>
+        <set-variable
+            variableName="gmailBody"
+            value="#[{
+                topicName: p('pubsub.topic'),
+                labelIds: [p('pubsub.watchLabelIds')],
+                labelFilterBehavior: 'INCLUDE'
+            }]"/>
+
+        <flow-ref name="call-gmail-api-flow" doc:name="Gmail Watch"/>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Store Watch Expiration">
+            <db:sql>UPDATE sync_state SET watch_expiration = to_timestamp(CAST(:expiration AS bigint) / 1000.0), updated_at = now() WHERE integration_account_id = CAST(:accountId AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                expiration: payload.expiration as String,
+                accountId: vars.accountId
+            }]]]></db:input-parameters>
+        </db:update>
 
     </sub-flow>
 
-    <!-- Garante um access token válido (renova se estiver perto de expirar) -->
+    <sub-flow name="disconnect-gmail-flow">
+
+        <try doc:name="Stop Gmail Watch">
+            <set-variable variableName="gmailMethod" value="POST"/>
+            <set-variable variableName="gmailPath" value="/stop"/>
+            <set-variable variableName="gmailQueryParams" value="#[{}]"/>
+            <set-variable variableName="gmailBody" value="#[null]"/>
+            <flow-ref name="call-gmail-api-flow" doc:name="Gmail Stop"/>
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Stop Failed - Continue Disconnect">
+                    <logger level="WARN" message="Não foi possível parar o watch do Gmail antes da desconexão."/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Revoke Tokens">
+            <db:sql>UPDATE oauth_tokens SET revoked_at = now(), updated_at = now() WHERE integration_account_id IN (SELECT id FROM integration_accounts WHERE provider = 'GMAIL')</db:sql>
+        </db:update>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Mark Account Disconnected">
+            <db:sql>UPDATE integration_accounts SET status = 'DISCONNECTED', updated_at = now() WHERE provider = 'GMAIL'</db:sql>
+        </db:update>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Clear Watch">
+            <db:sql>UPDATE sync_state SET watch_expiration = NULL, updated_at = now() WHERE integration_account_id IN (SELECT id FROM integration_accounts WHERE provider = 'GMAIL')</db:sql>
+        </db:update>
+
+    </sub-flow>
+
+    <sub-flow name="load-google-token-record-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Load Gmail Tokens">
+            <db:sql><![CDATA[SELECT t.integration_account_id AS account_id,
+    t.refresh_token_encrypted,
+    t.access_token_encrypted,
+    (t.access_token_expires_at > now() + (CAST(:marginMs AS integer) * interval '1 millisecond')) AS access_valid
+FROM oauth_tokens t
+JOIN integration_accounts a ON a.id = t.integration_account_id
+WHERE a.provider = 'GMAIL' AND a.status = 'CONNECTED' AND t.revoked_at IS NULL
+ORDER BY t.updated_at DESC
+LIMIT 1]]></db:sql>
+            <db:input-parameters><![CDATA[#[{marginMs: p('google.refreshMarginMs') as Number}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Token Record Exists?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error
+                    type="AUTH:NOT_AUTHORIZED"
+                    description="Gmail não autorizado. Acesse /gmail/authorize para autorizar a aplicação."/>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Decrypt Token Record">
+            <ee:message>
+                <ee:set-payload value="#[payload]"/>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="tokenRecord" resource="dw/token-record.dwl"/>
+            </ee:variables>
+        </ee:transform>
+
+    </sub-flow>
+
     <sub-flow name="ensure-google-access-token-flow">
 
-        <flow-ref
-            name="load-google-token-record-flow"
-            doc:name="Load Token Record"/>
+        <flow-ref name="load-google-token-record-flow" doc:name="Load Token Record"/>
 
         <choice doc:name="Access Token Still Valid?">
-            <when expression="#[(now() as Number {unit: 'milliseconds'}) >= ((vars.tokenRecord.expiresAt as Number) - (p('google.refreshMarginMs') as Number))]">
-                <flow-ref
-                    name="refresh-google-access-token-flow"
-                    doc:name="Refresh Access Token"/>
+            <when expression="#[vars.tokenRecord.accessValid == true and vars.tokenRecord.accessToken != null]">
+                <set-variable variableName="googleAccessToken" value="#[vars.tokenRecord.accessToken]"/>
             </when>
             <otherwise>
-                <set-variable
-                    variableName="googleAccessToken"
-                    value="#[vars.tokenRecord.accessToken]"/>
+                <flow-ref name="refresh-google-access-token-flow" doc:name="Refresh Access Token"/>
             </otherwise>
         </choice>
 
     </sub-flow>
 
     <!--
-        Renova o access token com o refresh token armazenado.
-        Concorrência: duas renovações simultâneas só geram dois access tokens válidos; o último a gravar prevalece.
-        Refresh token inválido/revogado (HTTP 400/401/403 do token endpoint): remove o registro e falha com AUTH:REFRESH_TOKEN_INVALID.
+        Renovação: lê o refresh token (decifrado), troca por novo access token e grava o access token cifrado.
+        Refresh revogado (400/401/403 do token endpoint): marca a conta como ERROR e a conexão como revogada.
+        Concorrência: duas renovações simultâneas geram dois access tokens válidos; a última gravação prevalece.
     -->
     <sub-flow name="refresh-google-access-token-flow">
 
-        <flow-ref
-            name="load-google-token-record-flow"
-            doc:name="Load Token Record"/>
+        <flow-ref name="load-google-token-record-flow" doc:name="Load Token Record"/>
 
         <set-payload
             mimeType="application/x-www-form-urlencoded"
@@ -213,33 +330,46 @@
                 doc:name="Google Token Endpoint"/>
             <error-handler>
                 <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN">
-                    <os:remove
-                        key="google-oauth-tokens"
-                        objectStore="Google_Token_Store"
-                        doc:name="Discard Revoked Tokens"/>
+                    <db:update config-ref="Postgres_DB_Config" doc:name="Revoke Refresh Token">
+                        <db:sql>UPDATE oauth_tokens SET revoked_at = now(), updated_at = now() WHERE integration_account_id = CAST(:accountId AS uuid)</db:sql>
+                        <db:input-parameters><![CDATA[#[{accountId: vars.tokenRecord.accountId}]]]></db:input-parameters>
+                    </db:update>
+                    <db:update config-ref="Postgres_DB_Config" doc:name="Mark Account Error">
+                        <db:sql>UPDATE integration_accounts SET status = 'ERROR', updated_at = now() WHERE id = CAST(:accountId AS uuid)</db:sql>
+                        <db:input-parameters><![CDATA[#[{accountId: vars.tokenRecord.accountId}]]]></db:input-parameters>
+                    </db:update>
                     <raise-error
                         type="AUTH:REFRESH_TOKEN_INVALID"
-                        description="Refresh token inválido ou revogado. Acesse /auth/google para autorizar novamente."/>
+                        description="Refresh token inválido ou revogado. Acesse /gmail/authorize para autorizar novamente."/>
                 </on-error-propagate>
             </error-handler>
         </try>
 
-        <set-variable
-            variableName="googleAccessToken"
-            value="#[payload.access_token]"/>
+        <set-variable variableName="plainAccessToken" value="#[payload.access_token]"/>
+        <set-variable variableName="googleAccessToken" value="#[payload.access_token]"/>
+        <set-variable variableName="expiresIn" value="#[(payload.expires_in default 3600) as Number]"/>
 
-        <set-payload
-            value="#[{
-                refreshToken: payload.refresh_token default vars.tokenRecord.refreshToken,
-                accessToken: payload.access_token,
-                expiresAt: (now() as Number {unit: 'milliseconds'}) + (((payload.expires_in default 3600) as Number) * 1000)
-            }]"
-            doc:name="Refreshed Token Record"/>
+        <ee:transform doc:name="Encrypt Access Token">
+            <ee:message>
+                <ee:set-payload value="#[payload]"/>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="encryptedAccess" resource="dw/encrypt-access-token.dwl"/>
+            </ee:variables>
+        </ee:transform>
 
-        <os:store
-            key="google-oauth-tokens"
-            objectStore="Google_Token_Store"
-            doc:name="Store Refreshed Tokens"/>
+        <db:update config-ref="Postgres_DB_Config" doc:name="Store Access Token">
+            <db:sql><![CDATA[UPDATE oauth_tokens
+SET access_token_encrypted = :accessToken,
+    access_token_expires_at = now() + (CAST(:expiresIn AS integer) * interval '1 second'),
+    updated_at = now()
+WHERE integration_account_id = CAST(:accountId AS uuid)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                accessToken: vars.encryptedAccess,
+                expiresIn: vars.expiresIn,
+                accountId: vars.tokenRecord.accountId
+            }]]]></db:input-parameters>
+        </db:update>
 
     </sub-flow>
 

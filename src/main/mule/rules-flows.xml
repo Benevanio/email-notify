@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <sub-flow name="list-rules-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="List Rules">
+            <db:sql>SELECT id, name, rule_type AS "ruleType", match_value AS "matchValue", min_urgency AS "minUrgency", enabled FROM notification_rules ORDER BY created_at</db:sql>
+        </db:select>
+
+        <set-payload value="#[payload map ((row) -> {
+            id: row.id as String,
+            name: row.name,
+            ruleType: row.ruleType,
+            matchValue: row.matchValue,
+            minUrgency: row.minUrgency,
+            enabled: row.enabled
+        })]"/>
+
+    </sub-flow>
+
+    <sub-flow name="create-rule-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Check Duplicate Rule">
+            <db:sql>SELECT id FROM notification_rules WHERE rule_type = :ruleType AND match_value = :matchValue</db:sql>
+            <db:input-parameters><![CDATA[#[{ruleType: payload.ruleType, matchValue: payload.matchValue}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Rule Is New?">
+            <when expression="#[not isEmpty(payload)]">
+                <raise-error type="RULE:DUPLICATE" description="Já existe uma regra com este tipo e valor."/>
+            </when>
+        </choice>
+
+        <set-variable variableName="ruleInput" value="#[payload]"/>
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Insert Rule">
+            <db:sql>INSERT INTO notification_rules (name, rule_type, match_value, min_urgency, enabled) VALUES (:name, :ruleType, :matchValue, :minUrgency, :enabled)</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                name: vars.ruleInput.name,
+                ruleType: vars.ruleInput.ruleType,
+                matchValue: vars.ruleInput.matchValue,
+                minUrgency: vars.ruleInput.minUrgency,
+                enabled: vars.ruleInput.enabled default true
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <set-variable variableName="ruleType" value="#[vars.ruleInput.ruleType]"/>
+        <set-variable variableName="matchValue" value="#[vars.ruleInput.matchValue]"/>
+        <flow-ref name="read-rule-by-value-flow" doc:name="Read Created Rule"/>
+
+    </sub-flow>
+
+    <sub-flow name="read-rule-by-value-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Read Rule By Value">
+            <db:sql>SELECT id, name, rule_type AS "ruleType", match_value AS "matchValue", min_urgency AS "minUrgency", enabled FROM notification_rules WHERE rule_type = :ruleType AND match_value = :matchValue</db:sql>
+            <db:input-parameters><![CDATA[#[{ruleType: vars.ruleType, matchValue: vars.matchValue}]]]></db:input-parameters>
+        </db:select>
+
+        <set-payload value="#[{
+            id: payload[0].id as String,
+            name: payload[0].name,
+            ruleType: payload[0].ruleType,
+            matchValue: payload[0].matchValue,
+            minUrgency: payload[0].minUrgency,
+            enabled: payload[0].enabled
+        }]"/>
+
+    </sub-flow>
+
+    <sub-flow name="get-rule-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Get Rule">
+            <db:sql>SELECT id, name, rule_type AS "ruleType", match_value AS "matchValue", min_urgency AS "minUrgency", enabled FROM notification_rules WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.ruleId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Rule Exists?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="RULE:NOT_FOUND" description="Regra não encontrada."/>
+            </when>
+        </choice>
+
+        <set-payload value="#[{
+            id: payload[0].id as String,
+            name: payload[0].name,
+            ruleType: payload[0].ruleType,
+            matchValue: payload[0].matchValue,
+            minUrgency: payload[0].minUrgency,
+            enabled: payload[0].enabled
+        }]"/>
+
+    </sub-flow>
+
+    <sub-flow name="update-rule-flow">
+
+        <flow-ref name="get-rule-flow" doc:name="Ensure Rule Exists"/>
+
+        <set-variable variableName="ruleInput" value="#[attributes.uriParams]"/>
+        <set-variable variableName="ruleBody" value="#[payload]"/>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Update Rule">
+            <db:sql>UPDATE notification_rules SET name = :name, rule_type = :ruleType, match_value = :matchValue, min_urgency = :minUrgency, enabled = :enabled, updated_at = now() WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                id: vars.ruleId,
+                name: vars.ruleBody.name,
+                ruleType: vars.ruleBody.ruleType,
+                matchValue: vars.ruleBody.matchValue,
+                minUrgency: vars.ruleBody.minUrgency,
+                enabled: vars.ruleBody.enabled default true
+            }]]]></db:input-parameters>
+        </db:update>
+
+        <flow-ref name="get-rule-flow" doc:name="Read Updated Rule"/>
+
+    </sub-flow>
+
+    <sub-flow name="delete-rule-flow">
+
+        <flow-ref name="get-rule-flow" doc:name="Ensure Rule Exists"/>
+
+        <db:delete config-ref="Postgres_DB_Config" doc:name="Delete Rule">
+            <db:sql>DELETE FROM notification_rules WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.ruleId}]]]></db:input-parameters>
+        </db:delete>
+
+        <set-payload value="#[null]"/>
+
+    </sub-flow>
+
+</mule>

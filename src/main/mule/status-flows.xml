@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <sub-flow name="gmail-status-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Gmail Status">
+            <db:sql><![CDATA[SELECT a.status, a.external_account, a.granted_scope,
+    to_char(s.watch_expiration AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS watch_expiration,
+    to_char(s.last_sync_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_sync_at,
+    s.last_sync_status
+FROM integration_accounts a
+LEFT JOIN sync_state s ON s.integration_account_id = a.id
+WHERE a.provider = 'GMAIL'
+ORDER BY a.created_at DESC
+LIMIT 1]]></db:sql>
+        </db:select>
+
+        <set-payload value="#[if (isEmpty(payload)) {
+            connected: false,
+            grantedScope: null
+        } else {
+            connected: payload[0].status == 'CONNECTED',
+            account: payload[0].external_account,
+            grantedScope: payload[0].granted_scope,
+            watchExpiration: payload[0].watch_expiration,
+            lastSyncAt: payload[0].last_sync_at,
+            lastSyncStatus: payload[0].last_sync_status
+        }]"/>
+
+    </sub-flow>
+
+    <sub-flow name="system-status-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Database Ping">
+            <db:sql>SELECT 1 AS ok</db:sql>
+        </db:select>
+
+        <set-variable variableName="databaseStatus" value="#[if (isEmpty(payload)) 'DOWN' else 'UP']"/>
+
+        <flow-ref name="gmail-status-flow" doc:name="Gmail Status"/>
+
+        <set-payload value="#[{
+            api: 'UP',
+            database: vars.databaseStatus,
+            gmail: if (payload.connected) 'CONNECTED' else 'DISCONNECTED',
+            whatsapp: if (isEmpty(p('whatsapp.accessToken')) or isEmpty(p('whatsapp.phoneNumberId'))) 'NOT_CONFIGURED' else 'CONFIGURED'
+        }]"/>
+
+    </sub-flow>
+
+    <sub-flow name="summary-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Dashboard Summary">
+            <db:sql><![CDATA[SELECT
+    (SELECT count(*) FROM emails) AS emails_monitored,
+    (SELECT count(*) FROM emails WHERE CAST(received_at AT TIME ZONE 'America/Fortaleza' AS date) = CAST(now() AT TIME ZONE 'America/Fortaleza' AS date)) AS received_today,
+    (SELECT count(*) FROM email_classifications WHERE urgency_level IN ('HIGH', 'CRITICAL')) AS important,
+    (SELECT count(*) FROM email_classifications WHERE urgency_level = 'CRITICAL') AS urgent,
+    (SELECT count(*) FROM notifications WHERE status IN ('SENT', 'DELIVERED', 'READ')) AS notifications_sent,
+    (SELECT count(*) FROM notifications WHERE status = 'PENDING') AS notifications_pending,
+    (SELECT count(*) FROM notifications WHERE status = 'FAILED') AS notifications_failed,
+    to_char((SELECT max(last_sync_at) FROM sync_state) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_sync_at]]></db:sql>
+        </db:select>
+
+        <set-payload value="#[{
+            emailsMonitored: payload[0].emails_monitored as Number,
+            receivedToday: payload[0].received_today as Number,
+            important: payload[0].important as Number,
+            urgent: payload[0].urgent as Number,
+            notificationsSent: payload[0].notifications_sent as Number,
+            notificationsPending: payload[0].notifications_pending as Number,
+            notificationsFailed: payload[0].notifications_failed as Number,
+            lastSyncAt: payload[0].last_sync_at
+        }]"/>
+
+    </sub-flow>
+
+    <!-- POST /gmail/sync: enfileira sincronização pelo cursor atual -->
+    <sub-flow name="request-sync-flow">
+
+        <set-variable variableName="jobType" value="PROCESS_GMAIL_HISTORY"/>
+        <set-variable variableName="jobDedupeKey" value="#['manual-sync:' ++ (now() as Number {unit: 'seconds'}) as String]"/>
+        <set-variable variableName="jobPayload" value="#[{}]"/>
+        <flow-ref name="enqueue-job-flow" doc:name="Enqueue Manual Sync"/>
+
+    </sub-flow>
+
+</mule>

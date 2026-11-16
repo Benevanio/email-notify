@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!--
+        Google Pub/Sub (push com OIDC). O token é validado no servidor do Google (tokeninfo):
+        assinatura, expiração, emissor, audiência e e-mail da service account.
+    -->
+    <sub-flow name="pubsub-webhook-flow">
+
+        <choice doc:name="Bearer Token Present?">
+            <when expression="#[vars.authHeader == null or not ((vars.authHeader as String) matches /^Bearer .+$/)]">
+                <raise-error type="WEBHOOK:INVALID_TOKEN" description="Token OIDC ausente."/>
+            </when>
+        </choice>
+
+        <set-variable variableName="idToken" value="#[(vars.authHeader as String) replace /^Bearer / with '']"/>
+
+        <try doc:name="Validate OIDC Token">
+            <http:request
+                config-ref="Google_Token_HTTP_Request_Config"
+                method="GET"
+                path="#[p('google.tokenInfoPath')]"
+                doc:name="Google TokenInfo">
+                <http:query-params><![CDATA[#[{id_token: vars.idToken}]]]></http:query-params>
+            </http:request>
+            <error-handler>
+                <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN">
+                    <raise-error type="WEBHOOK:INVALID_TOKEN" description="Token OIDC inválido ou expirado."/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+
+        <choice doc:name="Validate Token Claims">
+            <when expression="#[not ((payload.iss == 'https://accounts.google.com' or payload.iss == 'accounts.google.com')
+                and payload.aud == p('pubsub.audience')
+                and payload.email == p('pubsub.serviceAccount')
+                and (payload.email_verified default 'false') == 'true')]">
+                <raise-error type="WEBHOOK:INVALID_TOKEN" description="Claims OIDC não correspondem ao esperado."/>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Decode Pub/Sub Event">
+            <ee:message>
+                <ee:set-payload resource="dw/pubsub-event.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="pubsubMessageId" value="#[payload.messageId]"/>
+        <set-variable variableName="pubsubHistoryId" value="#[payload.historyId]"/>
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Check Duplicate Event">
+            <db:sql>SELECT id FROM webhook_events WHERE source = 'GOOGLE_PUBSUB' AND external_event_id = :eventId</db:sql>
+            <db:input-parameters><![CDATA[#[{eventId: vars.pubsubMessageId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="New Event?">
+            <when expression="#[isEmpty(payload)]">
+                <db:insert config-ref="Postgres_DB_Config" doc:name="Record Event">
+                    <db:sql>INSERT INTO webhook_events (source, external_event_id, status) VALUES ('GOOGLE_PUBSUB', :eventId, 'RECEIVED')</db:sql>
+                    <db:input-parameters><![CDATA[#[{eventId: vars.pubsubMessageId}]]]></db:input-parameters>
+                </db:insert>
+
+                <set-variable variableName="jobType" value="PROCESS_GMAIL_HISTORY"/>
+                <set-variable variableName="jobDedupeKey" value="#['history:' ++ vars.pubsubHistoryId]"/>
+                <set-variable variableName="jobPayload" value="#[{historyId: vars.pubsubHistoryId}]"/>
+                <flow-ref name="enqueue-job-flow" doc:name="Enqueue History Job"/>
+            </when>
+        </choice>
+
+    </sub-flow>
+
+    <!-- GET /webhooks/whatsapp: verificação do webhook pela Meta -->
+    <sub-flow name="whatsapp-verify-flow">
+
+        <choice doc:name="Verify Token Matches?">
+            <when expression="#[vars.hubMode == 'subscribe' and vars.hubVerifyToken == p('whatsapp.verifyToken')]">
+                <set-payload value="#[vars.hubChallenge]" mimeType="text/plain"/>
+            </when>
+            <otherwise>
+                <raise-error type="WEBHOOK:VERIFY_FAILED" description="Token de verificação inválido."/>
+            </otherwise>
+        </choice>
+
+    </sub-flow>
+
+    <!-- POST /webhooks/whatsapp: status de entrega. Assinatura X-Hub-Signature-256 validada antes. -->
+    <sub-flow name="whatsapp-status-flow">
+
+        <set-variable variableName="webhookBody" value="#[payload]"/>
+
+        <ee:transform doc:name="Verify Signature">
+            <ee:message>
+                <ee:set-payload resource="dw/verify-whatsapp-signature.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Signature Valid?">
+            <when expression="#[payload != true]">
+                <raise-error type="WEBHOOK:INVALID_SIGNATURE" description="Assinatura do webhook inválida."/>
+            </when>
+        </choice>
+
+        <set-payload value="#[vars.webhookBody]"/>
+
+        <ee:transform doc:name="Extract Statuses">
+            <ee:message>
+                <ee:set-payload resource="dw/whatsapp-status.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <foreach collection="#[payload]" doc:name="Apply Statuses">
+            <db:update config-ref="Postgres_DB_Config" doc:name="Update Notification Status">
+                <db:sql>UPDATE notifications
+SET status = :status,
+    last_error_code = :errorCode,
+    delivered_at = CASE WHEN :status IN ('DELIVERED', 'READ') THEN now() ELSE delivered_at END,
+    updated_at = now()
+WHERE provider_message_id = :providerMessageId</db:sql>
+                <db:input-parameters><![CDATA[#[{
+                    status: payload.status,
+                    errorCode: payload.errorCode,
+                    providerMessageId: payload.providerMessageId
+                }]]]></db:input-parameters>
+            </db:update>
+        </foreach>
+
+        <set-payload value="#[{accepted: true}]"/>
+
+    </sub-flow>
+
+</mule>

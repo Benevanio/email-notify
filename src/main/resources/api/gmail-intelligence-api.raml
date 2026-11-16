@@ -411,8 +411,16 @@ types:
           type: string
           required: false
       responses:
-        302:
-          description: Redireciona para o painel administrativo.
+        200:
+          body:
+            application/json:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [CONNECTED]
+                account: string
+                scope: string
         400:
           body:
             application/json:

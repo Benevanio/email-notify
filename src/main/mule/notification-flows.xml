@@ -2,6 +2,8 @@
 
 <mule
     xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
     xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -9,40 +11,213 @@
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http
-        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
     <!--
-        Aviso no celular via ntfy (https://ntfy.sh): instale o app ntfy, assine o tópico NTFY_TOPIC.
-        Entrada (vars): notificationTitle (ASCII), notificationMessage (texto puro, sem conteúdo de e-mails).
-        Falhas aqui NÃO interrompem o relatório: viram apenas log.
+        Envio via WhatsApp Business Cloud API (somente template aprovado).
+        Entradas: vars.waTemplateName, vars.waParameters (Array<String>), vars.waRecipient (opcional; padrão whatsapp.recipient).
+        Saída: payload = { messages: [{ id }] } da Meta.
     -->
-    <sub-flow name="send-phone-notification-flow">
+    <sub-flow name="send-whatsapp-template-flow">
 
-        <try doc:name="Send Phone Notification">
+        <set-payload
+            value="#[{
+                to: vars.waRecipient default p('whatsapp.recipient'),
+                templateName: vars.waTemplateName default p('whatsapp.templateName'),
+                language: vars.waLanguage default p('whatsapp.templateLanguage'),
+                parameters: vars.waParameters default []
+            }]"
+            doc:name="WhatsApp Template Input"/>
 
+        <ee:transform doc:name="WhatsApp Template Payload">
+            <ee:message>
+                <ee:set-payload resource="dw/whatsapp-template.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <try doc:name="Send WhatsApp Template">
             <http:request
-                config-ref="Notification_HTTP_Request_Config"
+                config-ref="WhatsApp_HTTP_Request_Config"
                 method="POST"
-                path="#['/' ++ p('notification.ntfy.topic')]"
-                doc:name="ntfy Publish">
+                path="#['/' ++ p('whatsapp.graphVersion') ++ '/' ++ p('whatsapp.phoneNumberId') ++ '/messages']"
+                doc:name="WhatsApp Cloud API Messages">
                 <http:headers><![CDATA[#[{
-                    Title: vars.notificationTitle,
-                    Tags: 'email'
+                    Authorization: 'Bearer ' ++ p('whatsapp.accessToken')
                 }]]]></http:headers>
-                <http:body><![CDATA[#[vars.notificationMessage]]]></http:body>
             </http:request>
-
             <error-handler>
-                <on-error-continue
-                    type="ANY"
-                    doc:name="Notification Not Sent">
-                    <logger
-                        level="WARN"
-                        message="#['Notificacao no celular nao enviada. correlationId=' ++ (vars.correlationId default '') ++ ' erro=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier)]"/>
-                </on-error-continue>
+                <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN, HTTP:TOO_MANY_REQUESTS, HTTP:INTERNAL_SERVER_ERROR, HTTP:SERVICE_UNAVAILABLE, HTTP:TIMEOUT, HTTP:CONNECTIVITY">
+                    <set-variable
+                        variableName="waErrorCode"
+                        value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+                    <raise-error
+                        type="WHATSAPP:DELIVERY_FAILED"
+                        description="Falha ao enviar a mensagem pelo WhatsApp."/>
+                </on-error-propagate>
             </error-handler>
-
         </try>
+
+    </sub-flow>
+
+    <!-- Job SEND_NOTIFICATION: payload = { notificationId } -->
+    <sub-flow name="send-notification-job-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Load Notification">
+            <db:sql><![CDATA[SELECT n.id, n.status, n.template_name, n.template_language, n.recipient_phone,
+    e.sender_name, e.sender_email, e.subject, e.received_at,
+    c.urgency_level, c.classification_reason
+FROM notifications n
+JOIN emails e ON e.id = n.email_id
+LEFT JOIN email_classifications c ON c.email_id = e.id AND c.classifier_version = 'heuristic-v1'
+WHERE n.id = CAST(:notificationId AS uuid)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{notificationId: vars.jobPayload.notificationId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Notification Pending?">
+            <when expression="#[isEmpty(payload) or payload[0].status != 'PENDING']">
+                <logger level="INFO" message="Notificação ignorada: não está pendente."/>
+            </when>
+            <otherwise>
+                <set-variable variableName="notification" value="#[payload[0]]"/>
+                <ee:transform doc:name="Notification Params">
+                    <ee:message>
+                        <ee:set-payload resource="dw/email-notification-params.dwl"/>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="waParameters" value="#[payload]"/>
+                <set-variable variableName="waTemplateName" value="#[vars.notification.template_name]"/>
+                <set-variable variableName="waLanguage" value="#[vars.notification.template_language]"/>
+                <set-variable variableName="waRecipient" value="#[vars.notification.recipient_phone]"/>
+
+                <try doc:name="Attempt Send">
+                    <flow-ref name="send-whatsapp-template-flow" doc:name="Send Template"/>
+
+                    <db:update config-ref="Postgres_DB_Config" doc:name="Mark Sent">
+                        <db:sql>UPDATE notifications SET status = 'SENT', provider_message_id = :providerId, sent_at = now(), updated_at = now(), last_error_code = NULL WHERE id = CAST(:notificationId AS uuid)</db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                            providerId: payload.messages[0].id,
+                            notificationId: vars.notification.id
+                        }]]]></db:input-parameters>
+                    </db:update>
+
+                    <db:insert config-ref="Postgres_DB_Config" doc:name="Record Attempt">
+                        <db:sql>INSERT INTO notification_attempts (notification_id, attempt_number, status, error_code) VALUES (CAST(:notificationId AS uuid), CAST(:attemptNumber AS integer), 'SUCCEEDED', NULL)</db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                            notificationId: vars.notification.id,
+                            attemptNumber: vars.jobAttempts
+                        }]]]></db:input-parameters>
+                    </db:insert>
+
+                    <error-handler>
+                        <on-error-propagate type="WHATSAPP:DELIVERY_FAILED">
+                            <db:insert config-ref="Postgres_DB_Config" doc:name="Record Failed Attempt">
+                                <db:sql>INSERT INTO notification_attempts (notification_id, attempt_number, status, error_code) VALUES (CAST(:notificationId AS uuid), CAST(:attemptNumber AS integer), 'FAILED', :errorCode)</db:sql>
+                                <db:input-parameters><![CDATA[#[{
+                                    notificationId: vars.notification.id,
+                                    attemptNumber: vars.jobAttempts,
+                                    errorCode: vars.waErrorCode
+                                }]]]></db:input-parameters>
+                            </db:insert>
+                            <db:update config-ref="Postgres_DB_Config" doc:name="Mark Notification Failed">
+                                <db:sql>UPDATE notifications SET status = CASE WHEN CAST(:attempts AS integer) >= CAST(:maxAttempts AS integer) THEN 'FAILED' ELSE 'PENDING' END, last_error_code = :errorCode, updated_at = now() WHERE id = CAST(:notificationId AS uuid)</db:sql>
+                                <db:input-parameters><![CDATA[#[{
+                                    notificationId: vars.notification.id,
+                                    attempts: vars.jobAttempts,
+                                    maxAttempts: p('whatsapp.maxAttempts'),
+                                    errorCode: vars.waErrorCode
+                                }]]]></db:input-parameters>
+                            </db:update>
+                            <raise-error
+                                type="WHATSAPP:DELIVERY_FAILED"
+                                description="Envio da notificação falhou; será tentado novamente conforme a política."/>
+                        </on-error-propagate>
+                    </error-handler>
+                </try>
+            </otherwise>
+        </choice>
+
+    </sub-flow>
+
+    <!-- GET /notifications -->
+    <sub-flow name="list-notifications-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="List Notifications">
+            <db:sql><![CDATA[SELECT n.id, n.email_id, n.channel, n.status, n.template_name, n.provider_message_id,
+    n.last_error_code,
+    to_char(n.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+    to_char(n.sent_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sent_at
+FROM notifications n
+WHERE (CAST(:status AS text) IS NULL OR n.status = CAST(:status AS text))
+  AND (CAST(:cursor AS timestamptz) IS NULL OR n.created_at < CAST(:cursor AS timestamptz))
+ORDER BY n.created_at DESC
+LIMIT CAST(:limit AS integer)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                status: vars.notificationFilters.status,
+                cursor: vars.notificationFilters.cursor,
+                limit: vars.notificationFilters.limit default 20
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <ee:transform doc:name="Notification Page">
+            <ee:message>
+                <ee:set-payload resource="dw/notification-page.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- GET /notifications/{id} -->
+    <sub-flow name="get-notification-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Get Notification">
+            <db:sql>SELECT id, email_id, channel, status, template_name, provider_message_id, last_error_code, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at, to_char(sent_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sent_at FROM notifications WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.notificationId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Notification Exists?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="NOTIFICATION:NOT_FOUND" description="Notificação não encontrada."/>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Notification">
+            <ee:message>
+                <ee:set-payload resource="dw/notification-item.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- POST /notifications/{id}/retry: apenas notificações em FAILED -->
+    <sub-flow name="retry-notification-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Read Status For Retry">
+            <db:sql>SELECT status FROM notifications WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.notificationId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Can Retry?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="NOTIFICATION:NOT_FOUND" description="Notificação não encontrada."/>
+            </when>
+            <when expression="#[payload[0].status != 'FAILED']">
+                <raise-error type="NOTIFICATION:INVALID_STATE" description="Somente notificações com falha podem ser reenviadas."/>
+            </when>
+        </choice>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Reset To Pending">
+            <db:sql>UPDATE notifications SET status = 'PENDING', last_error_code = NULL, updated_at = now() WHERE id = CAST(:id AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.notificationId}]]]></db:input-parameters>
+        </db:update>
+
+        <set-variable variableName="jobType" value="SEND_NOTIFICATION"/>
+        <set-variable variableName="jobDedupeKey" value="#['notification:' ++ vars.notificationId ++ ':retry:' ++ (now() as Number {unit: 'milliseconds'}) as String]"/>
+        <set-variable variableName="jobPayload" value="#[{notificationId: vars.notificationId}]"/>
+        <flow-ref name="enqueue-job-flow" doc:name="Enqueue Send Job"/>
 
     </sub-flow>
 

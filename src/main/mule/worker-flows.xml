@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:db="http://www.mulesoft.org/schema/mule/db"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db
+        http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!--
+        Worker da fila processing_jobs. Executa em uma única instância da aplicação.
+        Jobs: PROCESS_GMAIL_HISTORY, SYNC_FALLBACK, CLASSIFY_EMAIL (reservado), SEND_NOTIFICATION, RENEW_WATCH.
+        Falhas: retry com backoff 30s * 2^tentativas até max_attempts; depois status DEAD.
+    -->
+
+    <flow name="job-poller-flow">
+
+        <scheduler doc:name="Job Poll Schedule">
+            <scheduling-strategy>
+                <cron expression="${worker.pollCron}" timeZone="${report.timezone}"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Pending Jobs">
+            <db:sql>SELECT id, job_type, CAST(payload AS text) AS payload_text, attempts, max_attempts
+FROM processing_jobs
+WHERE status = 'PENDING' AND run_after <= now()
+ORDER BY run_after
+LIMIT CAST(:batch AS integer)</db:sql>
+            <db:input-parameters><![CDATA[#[{batch: p('worker.batchSize') as Number}]]]></db:input-parameters>
+        </db:select>
+
+        <foreach collection="#[payload]" doc:name="Each Job">
+            <flow-ref name="process-job-flow" doc:name="Process Job"/>
+        </foreach>
+
+    </flow>
+
+    <sub-flow name="process-job-flow">
+
+        <set-variable variableName="jobId" value="#[payload.id as String]"/>
+        <set-variable variableName="jobType" value="#[payload.job_type]"/>
+        <set-variable variableName="jobAttempts" value="#[(payload.attempts as Number) + 1]"/>
+        <set-variable variableName="jobPayload" value="#[read(payload.payload_text default '{}', 'application/json')]"/>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Lock Job">
+            <db:sql>UPDATE processing_jobs
+SET status = 'RUNNING', attempts = attempts + 1, locked_by = 'worker', locked_until = now() + interval '5 minutes', updated_at = now()
+WHERE id = CAST(:id AS uuid) AND status = 'PENDING'</db:sql>
+            <db:input-parameters><![CDATA[#[{id: vars.jobId}]]]></db:input-parameters>
+        </db:update>
+
+        <try doc:name="Run Job">
+            <choice doc:name="Job Type">
+                <when expression="#[vars.jobType == 'PROCESS_GMAIL_HISTORY']">
+                    <flow-ref name="process-gmail-history-job-flow" doc:name="History Job"/>
+                </when>
+                <when expression="#[vars.jobType == 'SYNC_FALLBACK']">
+                    <flow-ref name="sync-fallback-job-flow" doc:name="Fallback Job"/>
+                </when>
+                <when expression="#[vars.jobType == 'SEND_NOTIFICATION']">
+                    <flow-ref name="send-notification-job-flow" doc:name="Send Job"/>
+                </when>
+                <when expression="#[vars.jobType == 'RENEW_WATCH']">
+                    <flow-ref name="renew-watch-job-flow" doc:name="Renew Watch Job"/>
+                </when>
+                <otherwise>
+                    <raise-error type="JOB:UNKNOWN_TYPE" description="Tipo de job desconhecido."/>
+                </otherwise>
+            </choice>
+
+            <db:update config-ref="Postgres_DB_Config" doc:name="Mark Job Succeeded">
+                <db:sql>UPDATE processing_jobs SET status = 'SUCCEEDED', last_error_code = NULL, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = CAST(:id AS uuid)</db:sql>
+                <db:input-parameters><![CDATA[#[{id: vars.jobId}]]]></db:input-parameters>
+            </db:update>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Job Failed">
+                    <set-variable
+                        variableName="jobErrorCode"
+                        value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+                    <logger
+                        level="WARN"
+                        message="#['Job falhou. tipo=' ++ vars.jobType ++ ' erro=' ++ vars.jobErrorCode ++ ' tentativa=' ++ (vars.jobAttempts as String)]"/>
+                    <db:update config-ref="Postgres_DB_Config" doc:name="Schedule Retry Or Dead">
+                        <db:sql>UPDATE processing_jobs
+SET status = CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
+    run_after = now() + make_interval(secs => power(2, attempts) * 30),
+    last_error_code = :errorCode,
+    locked_by = NULL,
+    locked_until = NULL,
+    updated_at = now()
+WHERE id = CAST(:id AS uuid)</db:sql>
+                        <db:input-parameters><![CDATA[#[{id: vars.jobId, errorCode: vars.jobErrorCode}]]]></db:input-parameters>
+                    </db:update>
+                </on-error-continue>
+            </error-handler>
+        </try>
+
+    </sub-flow>
+
+    <!-- Enfileira um job. Entradas: vars.jobType, vars.jobDedupeKey, vars.jobPayload. Duplicado é ignorado. -->
+    <sub-flow name="enqueue-job-flow">
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Enqueue Job">
+            <db:sql>INSERT INTO processing_jobs (job_type, dedupe_key, payload, status, run_after)
+VALUES (:jobType, :dedupeKey, CAST(:payload AS jsonb), 'PENDING', now())
+ON CONFLICT (job_type, dedupe_key) DO NOTHING</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                jobType: vars.jobType,
+                dedupeKey: vars.jobDedupeKey,
+                payload: write(vars.jobPayload, "application/json")
+            }]]]></db:input-parameters>
+        </db:insert>
+
+    </sub-flow>
+
+    <sub-flow name="load-gmail-account-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Load Gmail Sync State">
+            <db:sql>SELECT a.id AS account_id, s.history_id
+FROM integration_accounts a
+LEFT JOIN sync_state s ON s.integration_account_id = a.id
+WHERE a.provider = 'GMAIL' AND a.status = 'CONNECTED'
+ORDER BY a.created_at DESC
+LIMIT 1</db:sql>
+        </db:select>
+
+        <choice doc:name="Account Connected?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="AUTH:NOT_AUTHORIZED" description="Gmail não conectado."/>
+            </when>
+        </choice>
+
+        <set-variable variableName="accountId" value="#[payload[0].account_id]"/>
+        <set-variable variableName="storedHistoryId" value="#[payload[0].history_id]"/>
+
+    </sub-flow>
+
+    <!-- PROCESS_GMAIL_HISTORY: lê o histórico desde o historyId guardado, processa as mensagens novas e avança o cursor -->
+    <sub-flow name="process-gmail-history-job-flow">
+
+        <flow-ref name="load-gmail-account-flow" doc:name="Load Account"/>
+
+        <choice doc:name="Has Starting History?">
+            <when expression="#[vars.storedHistoryId == null]">
+                <flow-ref name="sync-fallback-job-flow" doc:name="No History - Fallback"/>
+            </when>
+            <otherwise>
+                <set-variable variableName="historyPageToken" value="#[null]"/>
+                <set-variable variableName="historyPages" value="#[0]"/>
+                <set-variable variableName="historyIds" value="#[[]]"/>
+                <set-variable variableName="latestHistoryId" value="#[vars.jobPayload.historyId default vars.storedHistoryId]"/>
+
+                <try doc:name="Read History">
+                    <flow-ref name="collect-history-pages-flow" doc:name="Collect History"/>
+                    <error-handler>
+                        <on-error-continue type="GMAIL:NOT_FOUND" doc:name="History Expired - Fallback">
+                            <flow-ref name="sync-fallback-job-flow" doc:name="Fallback"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+
+                <choice doc:name="Fallback Used?">
+                    <when expression="#[vars.historyFallbackUsed != true]">
+                        <flow-ref name="process-message-ids-flow" doc:name="Process New Messages"/>
+                        <db:update config-ref="Postgres_DB_Config" doc:name="Advance History Cursor">
+                            <db:sql>UPDATE sync_state SET history_id = :historyId, last_sync_at = now(), last_sync_status = 'SUCCEEDED', last_error_code = NULL, updated_at = now() WHERE integration_account_id = CAST(:accountId AS uuid)</db:sql>
+                            <db:input-parameters><![CDATA[#[{historyId: vars.latestHistoryId as String, accountId: vars.accountId}]]]></db:input-parameters>
+                        </db:update>
+                    </when>
+                </choice>
+            </otherwise>
+        </choice>
+
+    </sub-flow>
+
+    <!-- Coleta páginas de history.list (messageAdded), com teto de páginas (gmail.historyMaxPages) -->
+    <sub-flow name="collect-history-pages-flow">
+
+        <set-variable variableName="historyFallbackUsed" value="#[false]"/>
+        <set-variable variableName="gmailMethod" value="GET"/>
+        <set-variable variableName="gmailPath" value="/history"/>
+        <set-variable
+            variableName="gmailQueryParams"
+            value="#[{startHistoryId: vars.storedHistoryId, historyTypes: 'messageAdded', pageToken: vars.historyPageToken}]"/>
+
+        <flow-ref name="call-gmail-api-flow" doc:name="List History Page"/>
+
+        <ee:transform doc:name="History Page">
+            <ee:message>
+                <ee:set-payload resource="dw/history-page.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="historyIds" value="#[vars.historyIds ++ payload.messageIds]"/>
+        <set-variable variableName="historyPageToken" value="#[payload.nextPageToken]"/>
+        <set-variable variableName="historyPages" value="#[vars.historyPages + 1]"/>
+        <set-variable variableName="latestHistoryId" value="#[payload.historyId default vars.latestHistoryId]"/>
+
+        <choice doc:name="More History Pages?">
+            <when expression="#[vars.historyPageToken != null and vars.historyPages < (p('gmail.historyMaxPages') as Number)]">
+                <flow-ref name="collect-history-pages-flow" doc:name="Next History Page"/>
+            </when>
+        </choice>
+
+    </sub-flow>
+
+    <!-- Processa uma lista de ids (vars.historyIds) -->
+    <sub-flow name="process-message-ids-flow">
+
+        <set-variable variableName="messageIdsToProcess" value="#[vars.historyIds distinctBy ((id) -> id)]"/>
+
+        <foreach collection="#[vars.messageIdsToProcess]" doc:name="Each Message">
+            <set-variable variableName="messageId" value="#[payload]"/>
+            <flow-ref name="process-single-message-flow" doc:name="Process Message"/>
+        </foreach>
+
+    </sub-flow>
+
+    <!-- Metadados -> normalização -> classificação -> persistência -> regras -> notificação -->
+    <sub-flow name="process-single-message-flow">
+
+        <db:select config-ref="Postgres_DB_Config" doc:name="Already Stored?">
+            <db:sql>SELECT id FROM emails WHERE integration_account_id = CAST(:accountId AS uuid) AND gmail_message_id = :messageId</db:sql>
+            <db:input-parameters><![CDATA[#[{accountId: vars.accountId, messageId: vars.messageId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="New Message?">
+            <when expression="#[isEmpty(payload)]">
+                <flow-ref name="get-message-metadata-flow" doc:name="Fetch Metadata"/>
+
+                <ee:transform doc:name="Normalize And Classify">
+                    <ee:message>
+                        <ee:set-payload resource="dw/normalize-messages.dwl"/>
+                    </ee:message>
+                </ee:transform>
+
+                <set-variable variableName="normalizedMessage" value="#[payload]"/>
+
+                <ee:transform doc:name="Email Row">
+                    <ee:message>
+                        <ee:set-payload resource="dw/email-row.dwl"/>
+                    </ee:message>
+                </ee:transform>
+
+                <db:insert config-ref="Postgres_DB_Config" doc:name="Store Email">
+                    <db:sql>INSERT INTO emails (integration_account_id, gmail_message_id, gmail_thread_id, sender_email, sender_domain, sender_name, subject, snippet, received_at, is_unread, label_ids)
+VALUES (CAST(:accountId AS uuid), :gmailMessageId, :gmailThreadId, :senderEmail, :senderDomain, :senderName, :subject, :snippet, CAST(:receivedAt AS timestamptz), :isUnread, CAST(:labelIds AS jsonb))
+ON CONFLICT (integration_account_id, gmail_message_id) DO NOTHING</db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        accountId: vars.accountId,
+                        gmailMessageId: payload.gmailMessageId,
+                        gmailThreadId: payload.gmailThreadId,
+                        senderEmail: payload.senderEmail,
+                        senderDomain: payload.senderDomain,
+                        senderName: payload.senderName,
+                        subject: payload.subject,
+                        snippet: payload.snippet,
+                        receivedAt: payload.receivedAt,
+                        isUnread: payload.isUnread,
+                        labelIds: payload.labelIds
+                    }]]]></db:input-parameters>
+                </db:insert>
+
+                <db:select config-ref="Postgres_DB_Config" doc:name="Read Email Id">
+                    <db:sql>SELECT id FROM emails WHERE integration_account_id = CAST(:accountId AS uuid) AND gmail_message_id = :messageId</db:sql>
+                    <db:input-parameters><![CDATA[#[{accountId: vars.accountId, messageId: vars.messageId}]]]></db:input-parameters>
+                </db:select>
+
+                <set-variable variableName="emailId" value="#[payload[0].id as String]"/>
+
+                <db:insert config-ref="Postgres_DB_Config" doc:name="Store Classification">
+                    <db:sql>INSERT INTO email_classifications (email_id, classifier_version, category, urgency_level, requires_action, possible_action, classification_reason)
+VALUES (CAST(:emailId AS uuid), :classifierVersion, :category, :urgencyLevel, :requiresAction, :possibleAction, :reason)
+ON CONFLICT (email_id, classifier_version) DO NOTHING</db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        emailId: vars.emailId,
+                        classifierVersion: vars.normalizedMessage.classification.classifierVersion,
+                        category: vars.normalizedMessage.classification.category,
+                        urgencyLevel: vars.normalizedMessage.classification.urgencyLevel,
+                        requiresAction: vars.normalizedMessage.classification.requiresAction,
+                        possibleAction: vars.normalizedMessage.classification.possibleAction,
+                        reason: vars.normalizedMessage.classification.classificationReason
+                    }]]]></db:input-parameters>
+                </db:insert>
+
+                <db:select config-ref="Postgres_DB_Config" doc:name="Load Rules">
+                    <db:sql>SELECT id, name, rule_type AS "ruleType", match_value AS "matchValue", min_urgency AS "minUrgency", enabled FROM notification_rules</db:sql>
+                </db:select>
+
+                <set-variable variableName="rules" value="#[payload]"/>
+
+                <ee:transform doc:name="Notification Decision">
+                    <ee:message>
+                        <ee:set-payload resource="dw/notification-decision.dwl"/>
+                    </ee:message>
+                </ee:transform>
+
+                <choice doc:name="Notify?">
+                    <when expression="#[payload.notify == true]">
+                        <db:insert config-ref="Postgres_DB_Config" doc:name="Create Notification">
+                            <db:sql>INSERT INTO notifications (email_id, channel, recipient_phone, template_name, template_language, status)
+VALUES (CAST(:emailId AS uuid), 'WHATSAPP', :recipient, :templateName, :templateLanguage, 'PENDING')
+ON CONFLICT (email_id, channel) DO NOTHING</db:sql>
+                            <db:input-parameters><![CDATA[#[{
+                                emailId: vars.emailId,
+                                recipient: p('whatsapp.recipient'),
+                                templateName: p('whatsapp.templateName'),
+                                templateLanguage: p('whatsapp.templateLanguage')
+                            }]]]></db:input-parameters>
+                        </db:insert>
+
+                        <db:select config-ref="Postgres_DB_Config" doc:name="Read Notification Id">
+                            <db:sql>SELECT id FROM notifications WHERE email_id = CAST(:emailId AS uuid) AND channel = 'WHATSAPP'</db:sql>
+                            <db:input-parameters><![CDATA[#[{emailId: vars.emailId}]]]></db:input-parameters>
+                        </db:select>
+
+                        <set-variable variableName="notificationId" value="#[payload[0].id as String]"/>
+                        <set-variable variableName="jobType" value="SEND_NOTIFICATION"/>
+                        <set-variable variableName="jobDedupeKey" value="#['notification:' ++ vars.notificationId]"/>
+                        <set-variable variableName="jobPayload" value="#[{notificationId: vars.notificationId}]"/>
+                        <flow-ref name="enqueue-job-flow" doc:name="Enqueue Notification"/>
+                    </when>
+                </choice>
+            </when>
+        </choice>
+
+    </sub-flow>
+
+    <!-- SYNC_FALLBACK: histórico expirou ou sem cursor. Lista as últimas mensagens da caixa de entrada e reancora o cursor no perfil. -->
+    <sub-flow name="sync-fallback-job-flow">
+
+        <flow-ref name="load-gmail-account-flow" doc:name="Load Account"/>
+
+        <set-variable variableName="historyFallbackUsed" value="#[true]"/>
+        <set-variable variableName="gmailMethod" value="GET"/>
+        <set-variable variableName="gmailPath" value="/messages"/>
+        <set-variable
+            variableName="gmailQueryParams"
+            value="#[{q: p('gmail.defaultQuery'), maxResults: p('gmail.fallbackMessages') as Number}]"/>
+
+        <flow-ref name="call-gmail-api-flow" doc:name="List Recent Messages"/>
+
+        <set-variable variableName="historyIds" value="#[(payload.messages default []) map ((message) -> message.id)]"/>
+        <flow-ref name="process-message-ids-flow" doc:name="Process Recent Messages"/>
+
+        <set-variable variableName="gmailPath" value="/profile"/>
+        <set-variable variableName="gmailQueryParams" value="#[{}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="Read Profile"/>
+
+        <db:update config-ref="Postgres_DB_Config" doc:name="Re-anchor History Cursor">
+            <db:sql>UPDATE sync_state SET history_id = :historyId, last_sync_at = now(), last_sync_status = 'SUCCEEDED', last_error_code = NULL, updated_at = now() WHERE integration_account_id = CAST(:accountId AS uuid)</db:sql>
+            <db:input-parameters><![CDATA[#[{historyId: (payload.historyId as String), accountId: vars.accountId}]]]></db:input-parameters>
+        </db:update>
+
+    </sub-flow>
+
+    <sub-flow name="renew-watch-job-flow">
+
+        <flow-ref name="load-gmail-account-flow" doc:name="Load Account"/>
+        <flow-ref name="register-gmail-watch-flow" doc:name="Renew Watch"/>
+
+    </sub-flow>
+
+    <!-- Agenda renovação do watch quando faltar menos de 1 dia para expirar (cron em worker.renewCron) -->
+    <flow name="schedule-watch-renewal-flow">
+
+        <scheduler doc:name="Watch Renewal Schedule">
+            <scheduling-strategy>
+                <cron expression="${worker.renewCron}" timeZone="${report.timezone}"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <db:insert config-ref="Postgres_DB_Config" doc:name="Enqueue Watch Renewal">
+            <db:sql>INSERT INTO processing_jobs (job_type, dedupe_key, payload, status, run_after)
+SELECT 'RENEW_WATCH', 'renew:' || to_char(now(), 'YYYYMMDDHH24'), CAST('{}' AS jsonb), 'PENDING', now()
+FROM sync_state s
+JOIN integration_accounts a ON a.id = s.integration_account_id
+WHERE a.provider = 'GMAIL' AND a.status = 'CONNECTED'
+  AND (s.watch_expiration IS NULL OR s.watch_expiration < now() + interval '1 day')
+ON CONFLICT (job_type, dedupe_key) DO NOTHING</db:sql>
+        </db:insert>
+
+    </flow>
+
+</mule>
