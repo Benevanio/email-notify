@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
+
+    
+    <error-handler name="global-error-handler">
+
+        <on-error-propagate
+            type="HTTP:UNAUTHORIZED"
+            logException="true"
+            doc:name="Authentication Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="401"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'UNAUTHORIZED',
+                    message: 'Authentication with Gmail is required.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Permission errors -->
+        <on-error-propagate
+            type="HTTP:FORBIDDEN"
+            logException="true"
+            doc:name="Permission Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="403"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'FORBIDDEN',
+                    message: 'Insufficient permissions to access Gmail resources.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Resource not found -->
+        <on-error-propagate
+            type="HTTP:NOT_FOUND"
+            logException="true"
+            doc:name="Resource Not Found">
+
+            <set-variable
+                variableName="httpStatus"
+                value="404"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'NOT_FOUND',
+                    message: 'Requested resource was not found.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Rate limit -->
+        <on-error-propagate
+            type="HTTP:TOO_MANY_REQUESTS"
+            logException="true"
+            doc:name="Rate Limit Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="429"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'RATE_LIMIT_EXCEEDED',
+                    message: 'Gmail API request limit exceeded. Please try again later.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Timeout -->
+        <on-error-propagate
+            type="HTTP:TIMEOUT"
+            logException="true"
+            doc:name="Timeout Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="504"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'GATEWAY_TIMEOUT',
+                    message: 'Gmail API request timed out.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Connectivity -->
+        <on-error-propagate
+            type="HTTP:CONNECTIVITY"
+            logException="true"
+            doc:name="Connectivity Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="503"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'SERVICE_UNAVAILABLE',
+                    message: 'Unable to connect to Gmail API.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Validation -->
+        <on-error-propagate
+            type="VALIDATION:*"
+            logException="false"
+            doc:name="Validation Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="400"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'VALIDATION_ERROR',
+                    message: 'Request validation failed.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+        <!-- Unexpected errors -->
+        <on-error-propagate
+            type="ANY"
+            logException="true"
+            doc:name="Internal Server Error">
+
+            <set-variable
+                variableName="httpStatus"
+                value="500"/>
+
+            <set-payload
+                mimeType="application/json"
+                value="#[{
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'An unexpected error occurred.',
+                    correlationId: vars.correlationId default correlationId
+                }]"/>
+
+        </on-error-propagate>
+
+    </error-handler>
+
+</mule>

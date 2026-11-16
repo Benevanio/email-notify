@@ -1,0 +1,52 @@
+
+# Application
+app:
+  name: "gmail-intelligence-api"
+  version: "v1"
+  environment: "dev"
+
+# HTTP Listener
+http:
+  host: "0.0.0.0"
+  port: "8081"
+  timeout: "60000"
+
+# Gmail API
+gmail:
+  baseUrl: "https://gmail.googleapis.com"
+  apiVersion: "v1"
+  user: "me"
+  defaultMaxResults: "20"
+  maxResults: "100"
+  defaultQuery: "in:inbox"
+  maxEmailsPerReport: "500"
+
+# Google OAuth 2.0
+google:
+  authUrl: "https://accounts.google.com/o/oauth2/v2/auth"
+  tokenUrl: "https://oauth2.googleapis.com/token"
+  clientId: "${GOOGLE_CLIENT_ID}"
+  clientSecret: "${GOOGLE_CLIENT_SECRET}"
+  redirectUri: "${GOOGLE_REDIRECT_URI}"
+  scopes: "https://www.googleapis.com/auth/gmail.readonly"
+
+# Report
+report:
+  defaultGroupBy: "day"
+  includeRead: "true"
+  includeUnread: "true"
+  timezone: "America/Fortaleza"
+
+# Logging
+logging:
+  level: "DEBUG"
+  logEmailContent: "false"
+
+# Retry
+retry:
+  maxAttempts: "3"
+  interval: "1000"
+
+# Security
+security:
+  readOnly: "true"

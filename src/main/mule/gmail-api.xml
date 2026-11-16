@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit
+        http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd">
+
+    <!-- Main API entry point -->
+    <flow name="gmail-intelligence-api-main">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="/api/*"
+            allowedMethods="GET,POST"
+            doc:name="API Listener"/>
+
+        <!-- Correlation ID -->
+        <set-variable
+            variableName="correlationId"
+            value="#[correlationId]"
+            doc:name="Set Correlation ID"/>
+
+        <!-- APIKit Router -->
+        <apikit:router
+            config-ref="gmail-intelligence-api-config"
+            doc:name="APIkit Router"/>
+
+        <error-handler ref="global-error-handler"/>
+
+    </flow>
+
+    <flow name="get-health-flow">
+
+        <set-payload
+            mimeType="application/json"
+            doc:name="Health Response"
+            value="#[{
+                status: 'UP',
+                service: 'Gmail Intelligence API',
+                version: p('app.version'),
+                environment: p('app.environment')
+            }]"/>
+		<error-handler ref="global-error-handler" />
+
+    
+</flow>
+
+</mule>
