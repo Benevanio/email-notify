@@ -1,5 +1,163 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd"></mule>
+    <!-- Listagem de e-mails -->
+    <sub-flow name="get-gmail-messages-flow">
+
+        <flow-ref
+            name="ensure-google-access-token-flow"
+            doc:name="Ensure Google Access Token"/>
+
+        <http:request
+            config-ref="Gmail_HTTP_Request_Config"
+            method="GET"
+            path="/messages"
+            doc:name="List Gmail Messages">
+
+            <http:headers><![CDATA[#[{
+                Authorization: "Bearer " ++ vars.googleAccessToken
+            }]]]></http:headers>
+
+            <http:query-params><![CDATA[#[{
+                maxResults: vars.maxResults default 20,
+                q: vars.gmailQuery default "in:inbox"
+            }]]]></http:query-params>
+
+        </http:request>
+
+    </sub-flow>
+
+    <!-- Consulta de um e-mail individual -->
+    <sub-flow name="get-gmail-message-flow">
+
+        <flow-ref
+            name="ensure-google-access-token-flow"
+            doc:name="Ensure Google Access Token"/>
+
+        <http:request
+            config-ref="Gmail_HTTP_Request_Config"
+            method="GET"
+            path="#['/messages/' ++ vars.emailId]"
+            doc:name="Get Gmail Message">
+
+            <http:headers><![CDATA[#[{
+                Authorization: "Bearer " ++ vars.googleAccessToken
+            }]]]></http:headers>
+
+            <http:query-params><![CDATA[#[{
+                format: "full"
+            }]]]></http:query-params>
+
+        </http:request>
+
+    </sub-flow>
+
+    <!-- Consulta de uma conversa completa -->
+    <sub-flow name="get-gmail-thread-flow">
+
+        <flow-ref
+            name="ensure-google-access-token-flow"
+            doc:name="Ensure Google Access Token"/>
+
+        <http:request
+            config-ref="Gmail_HTTP_Request_Config"
+            method="GET"
+            path="#['/threads/' ++ vars.threadId]"
+            doc:name="Get Gmail Thread">
+
+            <http:headers><![CDATA[#[{
+                Authorization: "Bearer " ++ vars.googleAccessToken
+            }]]]></http:headers>
+
+            <http:query-params><![CDATA[#[{
+                format: "full"
+            }]]]></http:query-params>
+
+        </http:request>
+
+    </sub-flow>
+
+    <!-- Listagem de e-mails não lidos -->
+    <sub-flow name="get-unread-gmail-messages-flow">
+
+        <set-variable
+            variableName="gmailQuery"
+            value="is:unread"
+            doc:name="Set Unread Query"/>
+
+        <flow-ref
+            name="get-gmail-messages-flow"
+            doc:name="Get Unread Messages"/>
+
+    </sub-flow>
+
+    <!-- Busca de e-mails por critérios -->
+    <sub-flow name="search-gmail-messages-flow">
+
+        <set-variable
+            variableName="gmailQuery"
+            value="#[
+                vars.searchQuery default ''
+            ]"
+            doc:name="Set Search Query"/>
+
+        <flow-ref
+            name="get-gmail-messages-flow"
+            doc:name="Search Gmail Messages"/>
+
+    </sub-flow>
+
+    <!-- Normalização dos dados de uma mensagem -->
+    <sub-flow name="normalize-gmail-message-flow">
+
+        <ee:transform doc:name="Normalize Gmail Message">
+            <ee:message>
+                <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+
+var message = payload
+var headers = message.payload.headers default []
+
+fun getHeader(headerName) =
+    (
+        headers filter ((header) ->
+            lower(header.name default "") == lower(headerName)
+        )
+    )[0].value default null
+
+---
+{
+    id: message.id default null,
+    threadId: message.threadId default null,
+    from: getHeader("From") default "Unknown",
+    to: getHeader("To") default "",
+    cc: getHeader("Cc") default "",
+    subject: getHeader("Subject") default "(Sem assunto)",
+    date: getHeader("Date") default null,
+    snippet: message.snippet default "",
+    unread: (message.labelIds default []) contains "UNREAD",
+    labels: message.labelIds default [],
+    internalDate: message.internalDate default null
+}
+                ]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+</mule>

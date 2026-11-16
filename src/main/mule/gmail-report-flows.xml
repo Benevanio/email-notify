@@ -1,5 +1,85 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd"></mule>
+<mule
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <flow name="generate-email-report-flow">
+
+        <logger
+            level="INFO"
+            doc:name="Start Report Generation"
+            message="Starting Gmail report generation. CorrelationId: #[correlationId]"/>
+
+        <set-variable
+            variableName="reportRequest"
+            value="#[payload]"
+            doc:name="Store Report Request"/>
+
+        <choice doc:name="Validate Report Request">
+
+            <when expression="#[vars.reportRequest.startDate == null&#10;                or vars.reportRequest.endDate == null&#10;                or (vars.reportRequest.startDate as Date) &gt; (vars.reportRequest.endDate as Date)]">
+
+                <raise-error
+                    type="VALIDATION:INVALID_INPUT"
+                    description="Invalid report period."/>
+
+            </when>
+
+        </choice>
+
+        <set-variable
+            variableName="gmailQuery"
+            value="#[
+                'after:' ++
+                ((vars.reportRequest.startDate as Date) - |P1D|) as String {format: 'yyyy/MM/dd'}
+                ++
+                ' before:' ++
+                ((vars.reportRequest.endDate as Date) + |P1D|) as String {format: 'yyyy/MM/dd'}
+            ]"
+            doc:name="Build Gmail Query"/>
+
+        <flow-ref
+            name="get-all-gmail-messages-flow"
+            doc:name="Fetch Gmail Messages"/>
+        <ee:transform doc:name="Prepare Report Data">
+
+            <ee:message>
+                <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    reportRequest: vars.reportRequest,
+    emails: payload default []
+}
+                ]]></ee:set-payload>
+            </ee:message>
+
+        </ee:transform>
+
+        <!-- Build Final Report -->
+        <ee:transform doc:name="Build Email Report">
+
+            <ee:message>
+                <ee:set-payload resource="dw/build-email-report.dwl"/>
+            </ee:message>
+
+        </ee:transform>
+
+        <logger
+            level="INFO"
+            doc:name="Report Generated"
+            message="Gmail report generated successfully."/>
+
+    </flow>
+
+</mule>
