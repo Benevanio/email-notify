@@ -45,3 +45,15 @@ target/
 .mule/
 .DS_Store
 velocity.log
+# --------------------------------- #
+# Gmail Intelligence API specifics  #
+# --------------------------------- #
+# Relatórios gerados (contêm metadados de e-mails)
+reports/
+# Variáveis locais com segredos (nunca versionar)
+.env
+*.env
+env-local*.yaml
+*-secrets*.yaml
+# Tokens OAuth persistidos pelo Object Store
+.mule/

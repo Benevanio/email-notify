@@ -1,52 +1,80 @@
-
-# Application
 app:
-  name: "gmail-intelligence-api"
-  version: "v1"
-  environment: "dev"
+  name: "bene-notify-api"
+  version: "1.0.0"
+  environment: "${APP_ENVIRONMENT}"
 
-# HTTP Listener
 http:
-  host: "0.0.0.0"
-  port: "8081"
-  timeout: "60000"
+  host: "${HTTP_HOST}"
+  port: "${HTTP_PORT}"
 
-# Gmail API
+db:
+  host: "${DB_HOST}"
+  port: "${DB_PORT}"
+  name: "${DB_NAME}"
+  user: "${DB_USER}"
+  password: "${DB_PASSWORD}"
+
+security:
+  tokenEncryptionKey: "${TOKEN_ENCRYPTION_KEY}"
+  adminDashboardUrl: "${ADMIN_DASHBOARD_URL}"
+  corsOrigin: "${CORS_ORIGIN}"
+
 gmail:
-  baseUrl: "https://gmail.googleapis.com"
-  apiVersion: "v1"
-  user: "me"
+  host: "gmail.googleapis.com"
+  basePath: "/gmail/v1/users/me"
+  responseTimeoutMs: "30000"
   defaultMaxResults: "20"
-  maxResults: "100"
   defaultQuery: "in:inbox"
-  maxEmailsPerReport: "500"
+  pageSize: "100"
+  maxListPages: "10"
+  maxConcurrency: "5"
+  maxMessagesPerReport: "200"
+  maxAllowedMessagesPerReport: "500"
+  maxBodyCharacters: "5000"
+  historyMaxPages: "10"
+  fallbackMessages: "50"
+  retry:
+    maxRetries: "3"
+    intervalMs: "1000"
 
-# Google OAuth 2.0
 google:
-  authUrl: "https://accounts.google.com/o/oauth2/v2/auth"
-  tokenUrl: "https://oauth2.googleapis.com/token"
+  authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth"
+  tokenHost: "oauth2.googleapis.com"
+  tokenPath: "/token"
+  tokenInfoPath: "/tokeninfo"
+  scope: "https://www.googleapis.com/auth/gmail.readonly"
   clientId: "${GOOGLE_CLIENT_ID}"
   clientSecret: "${GOOGLE_CLIENT_SECRET}"
   redirectUri: "${GOOGLE_REDIRECT_URI}"
-  scopes: "https://www.googleapis.com/auth/gmail.readonly"
+  refreshMarginMs: "60000"
 
-# Report
+pubsub:
+  topic: "${PUBSUB_TOPIC}"
+  audience: "${PUBSUB_AUDIENCE}"
+  serviceAccount: "${PUBSUB_SERVICE_ACCOUNT}"
+  watchLabelIds: "INBOX"
+
+whatsapp:
+  host: "graph.facebook.com"
+  graphVersion: "${META_GRAPH_API_VERSION}"
+  accessToken: "${META_ACCESS_TOKEN}"
+  phoneNumberId: "${META_PHONE_NUMBER_ID}"
+  appSecret: "${META_APP_SECRET}"
+  verifyToken: "${META_VERIFY_TOKEN}"
+  recipient: "${WHATSAPP_RECIPIENT_NUMBER}"
+  templateName: "${WHATSAPP_TEMPLATE_NAME}"
+  templateLanguage: "${WHATSAPP_TEMPLATE_LANGUAGE}"
+  dailyTemplateName: "${WHATSAPP_DAILY_TEMPLATE_NAME}"
+  maxAttempts: "5"
+
 report:
-  defaultGroupBy: "day"
-  includeRead: "true"
-  includeUnread: "true"
   timezone: "America/Fortaleza"
+  maxRangeDays: "366"
+  outputDir: "reports"
+  daily:
+    cron: "0 0 8 * * ?"
 
-# Logging
-logging:
-  level: "DEBUG"
-  logEmailContent: "false"
-
-# Retry
-retry:
-  maxAttempts: "3"
-  interval: "1000"
-
-# Security
-security:
-  readOnly: "true"
+worker:
+  pollCron: "0/30 * * * * ?"
+  batchSize: "10"
+  renewCron: "0 0 * * * ?"

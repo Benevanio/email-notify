@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns:os="http://www.mulesoft.org/schema/mule/os"
+    xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!--
+        OAuth 2.0 (Google) — escopo somente leitura.
+        Registro do token: Google_Token_Store, chave "google-oauth-tokens" = { refreshToken, accessToken, expiresAt(ms) }.
+        Nenhum token é devolvido em respostas HTTP, logs ou mensagens de erro.
+    -->
+
+    <!-- GET /auth/google: gera a URL de consentimento e um state anti-CSRF -->
+    <sub-flow name="build-authorization-url-flow">
+
+        <set-variable
+            variableName="oauthState"
+            value="#[uuid()]"
+            doc:name="Generate OAuth State"/>
+
+        <set-payload
+            value="#[vars.oauthState]"
+            doc:name="State Payload"/>
+
+        <os:store
+            key="#[vars.oauthState]"
+            objectStore="OAuth_State_Store"
+            doc:name="Store OAuth State"/>
+
+        <ee:transform doc:name="Build Authorization URL">
+            <ee:message>
+                <ee:set-payload resource="dw/build-authorization-url.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- GET /auth/google/callback: valida o state, troca o code por tokens e os armazena -->
+    <sub-flow name="handle-oauth-callback-flow">
+
+        <choice doc:name="Check Callback Parameters">
+            <when expression="#[vars.oauthError != null]">
+                <raise-error
+                    type="AUTH:AUTHORIZATION_DENIED"
+                    description="A autorização foi negada no Google."/>
+            </when>
+            <when expression="#[vars.oauthState == null or vars.oauthCode == null]">
+                <raise-error
+                    type="VALIDATION:INVALID_INPUT"
+                    description="Os parâmetros code e state são obrigatórios."/>
+            </when>
+        </choice>
+
+        <try doc:name="Validate State">
+            <os:retrieve
+                key="#[vars.oauthState]"
+                objectStore="OAuth_State_Store"
+                target="oauthStateRecord"
+                doc:name="Retrieve OAuth State"/>
+            <error-handler>
+                <on-error-propagate type="OS:KEY_NOT_FOUND">
+                    <raise-error
+                        type="AUTH:INVALID_STATE"
+                        description="State inválido ou expirado. Gere uma nova URL em /auth/google."/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+
+        <os:remove
+            key="#[vars.oauthState]"
+            objectStore="OAuth_State_Store"
+            doc:name="Consume OAuth State"/>
+
+        <set-payload
+            mimeType="application/x-www-form-urlencoded"
+            value="#[{
+                grant_type: 'authorization_code',
+                code: vars.oauthCode,
+                client_id: p('google.clientId'),
+                client_secret: p('google.clientSecret'),
+                redirect_uri: p('google.redirectUri')
+            }]"
+            doc:name="Token Exchange Form"/>
+
+        <try doc:name="Exchange Authorization Code">
+            <http:request
+                config-ref="Google_Token_HTTP_Request_Config"
+                method="POST"
+                path="#[p('google.tokenPath')]"
+                doc:name="Google Token Endpoint"/>
+            <error-handler>
+                <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN">
+                    <raise-error
+                        type="AUTH:TOKEN_EXCHANGE_FAILED"
+                        description="Não foi possível trocar o código de autorização por tokens."/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+
+        <choice doc:name="Check Refresh Token">
+            <when expression="#[payload.refresh_token == null]">
+                <raise-error
+                    type="AUTH:TOKEN_EXCHANGE_FAILED"
+                    description="O Google não retornou refresh token. Revogue o acesso anterior em myaccount.google.com e autorize novamente."/>
+            </when>
+        </choice>
+
+        <set-payload
+            value="#[{
+                refreshToken: payload.refresh_token,
+                accessToken: payload.access_token,
+                expiresAt: (now() as Number {unit: 'milliseconds'}) + (((payload.expires_in default 3600) as Number) * 1000)
+            }]"
+            doc:name="Token Record"/>
+
+        <os:store
+            key="google-oauth-tokens"
+            objectStore="Google_Token_Store"
+            doc:name="Store Google Tokens"/>
+
+        <set-payload
+            mimeType="application/json"
+            value="#[{
+                status: 'AUTHORIZED',
+                scope: p('google.scope'),
+                message: 'Autorização concluída. A API já pode consultar o Gmail em modo somente leitura.'
+            }]"
+            doc:name="Authorization Status"/>
+
+    </sub-flow>
+
+    <!-- Lê o registro de tokens. Sem registro, a API pede nova autorização. -->
+    <sub-flow name="load-google-token-record-flow">
+
+        <try doc:name="Load Token Record">
+            <os:retrieve
+                key="google-oauth-tokens"
+                objectStore="Google_Token_Store"
+                target="tokenRecord"
+                doc:name="Retrieve Google Tokens"/>
+            <error-handler>
+                <on-error-propagate type="OS:KEY_NOT_FOUND">
+                    <raise-error
+                        type="AUTH:NOT_AUTHORIZED"
+                        description="Gmail não autorizado. Acesse /auth/google para autorizar a aplicação."/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+
+    </sub-flow>
+
+    <!-- Garante um access token válido (renova se estiver perto de expirar) -->
+    <sub-flow name="ensure-google-access-token-flow">
+
+        <flow-ref
+            name="load-google-token-record-flow"
+            doc:name="Load Token Record"/>
+
+        <choice doc:name="Access Token Still Valid?">
+            <when expression="#[(now() as Number {unit: 'milliseconds'}) >= ((vars.tokenRecord.expiresAt as Number) - (p('google.refreshMarginMs') as Number))]">
+                <flow-ref
+                    name="refresh-google-access-token-flow"
+                    doc:name="Refresh Access Token"/>
+            </when>
+            <otherwise>
+                <set-variable
+                    variableName="googleAccessToken"
+                    value="#[vars.tokenRecord.accessToken]"/>
+            </otherwise>
+        </choice>
+
+    </sub-flow>
+
+    <!--
+        Renova o access token com o refresh token armazenado.
+        Concorrência: duas renovações simultâneas só geram dois access tokens válidos; o último a gravar prevalece.
+        Refresh token inválido/revogado (HTTP 400/401/403 do token endpoint): remove o registro e falha com AUTH:REFRESH_TOKEN_INVALID.
+    -->
+    <sub-flow name="refresh-google-access-token-flow">
+
+        <flow-ref
+            name="load-google-token-record-flow"
+            doc:name="Load Token Record"/>
+
+        <set-payload
+            mimeType="application/x-www-form-urlencoded"
+            value="#[{
+                grant_type: 'refresh_token',
+                refresh_token: vars.tokenRecord.refreshToken,
+                client_id: p('google.clientId'),
+                client_secret: p('google.clientSecret')
+            }]"
+            doc:name="Refresh Token Form"/>
+
+        <try doc:name="Call Google Token Endpoint">
+            <http:request
+                config-ref="Google_Token_HTTP_Request_Config"
+                method="POST"
+                path="#[p('google.tokenPath')]"
+                doc:name="Google Token Endpoint"/>
+            <error-handler>
+                <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN">
+                    <os:remove
+                        key="google-oauth-tokens"
+                        objectStore="Google_Token_Store"
+                        doc:name="Discard Revoked Tokens"/>
+                    <raise-error
+                        type="AUTH:REFRESH_TOKEN_INVALID"
+                        description="Refresh token inválido ou revogado. Acesse /auth/google para autorizar novamente."/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+
+        <set-variable
+            variableName="googleAccessToken"
+            value="#[payload.access_token]"/>
+
+        <set-payload
+            value="#[{
+                refreshToken: payload.refresh_token default vars.tokenRecord.refreshToken,
+                accessToken: payload.access_token,
+                expiresAt: (now() as Number {unit: 'milliseconds'}) + (((payload.expires_in default 3600) as Number) * 1000)
+            }]"
+            doc:name="Refreshed Token Record"/>
+
+        <os:store
+            key="google-oauth-tokens"
+            objectStore="Google_Token_Store"
+            doc:name="Store Refreshed Tokens"/>
+
+    </sub-flow>
+
+</mule>

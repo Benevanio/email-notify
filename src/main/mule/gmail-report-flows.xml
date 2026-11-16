@@ -2,83 +2,234 @@
 
 <mule
     xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns:file="http://www.mulesoft.org/schema/mule/file"
     xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="
-http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/ee/core
-        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/file
+        http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
 
-    <flow name="generate-email-report-flow">
+    <!--
+        Relatório de e-mails.
+        POST /reports/emails -> generate-email-report-flow (payload = corpo do pedido)
+        Job diário (scheduler)  -> daily-email-report-flow: gera o relatório, grava em disco e avisa no celular.
+    -->
+
+    <sub-flow name="generate-email-report-flow">
 
         <logger
             level="INFO"
-            doc:name="Start Report Generation"
-            message="Starting Gmail report generation. CorrelationId: #[correlationId]"/>
+            doc:name="Report Started"
+            message="#['Relatório de e-mails iniciado. correlationId=' ++ (vars.correlationId default correlationId)]"/>
 
-        <set-variable
-            variableName="reportRequest"
-            value="#[payload]"
-            doc:name="Store Report Request"/>
+        <ee:transform doc:name="Validate Report Request">
+            <ee:message>
+                <ee:set-payload resource="dw/validate-report-request.dwl"/>
+            </ee:message>
+        </ee:transform>
 
-        <choice doc:name="Validate Report Request">
-
-            <when expression="#[vars.reportRequest.startDate == null&#10;                or vars.reportRequest.endDate == null&#10;                or (vars.reportRequest.startDate as Date) &gt; (vars.reportRequest.endDate as Date)]">
-
+        <choice doc:name="Request Is Valid?">
+            <when expression="#[payload.valid == false]">
                 <raise-error
                     type="VALIDATION:INVALID_INPUT"
-                    description="Invalid report period."/>
-
+                    description="#[payload.errors joinBy ' ']"/>
             </when>
-
         </choice>
 
         <set-variable
+            variableName="reportRequest"
+            value="#[payload.request]"/>
+
+        <!-- Consulta ao Gmail com margem de 1 dia de cada lado; o recorte exato é feito no DataWeave (fuso report.timezone) -->
+        <set-variable
             variableName="gmailQuery"
-            value="#[
-                'after:' ++
-                ((vars.reportRequest.startDate as Date) - |P1D|) as String {format: 'yyyy/MM/dd'}
-                ++
-                ' before:' ++
-                ((vars.reportRequest.endDate as Date) + |P1D|) as String {format: 'yyyy/MM/dd'}
-            ]"
-            doc:name="Build Gmail Query"/>
+            value="#[trim((vars.reportRequest.query default '') ++ ' after:' ++ (((vars.reportRequest.startDate as Date) - |P1D|) as String {format: 'yyyy/MM/dd'}) ++ ' before:' ++ (((vars.reportRequest.endDate as Date) + |P2D|) as String {format: 'yyyy/MM/dd'}))]"/>
+
+        <set-variable variableName="maxMessages" value="#[vars.reportRequest.maxEmails]"/>
+        <set-variable variableName="configuredPageSize" value="#[p('gmail.pageSize') as Number]"/>
+        <set-variable variableName="maxPages" value="#[p('gmail.maxListPages') as Number]"/>
+        <set-variable variableName="collectedIds" value="#[[]]"/>
+        <set-variable variableName="pageToken" value="#[null]"/>
+        <set-variable variableName="pagesFetched" value="#[0]"/>
 
         <flow-ref
-            name="get-all-gmail-messages-flow"
-            doc:name="Fetch Gmail Messages"/>
-        <ee:transform doc:name="Prepare Report Data">
+            name="collect-message-ids-flow"
+            doc:name="Collect Message Ids"/>
 
+        <set-variable
+            variableName="collectionTruncated"
+            value="#[vars.pageToken != null]"/>
+
+        <parallel-foreach
+            collection="#[vars.collectedIds]"
+            maxConcurrency="${gmail.maxConcurrency}"
+            doc:name="Fetch Message Metadata">
+
+            <set-variable
+                variableName="messageId"
+                value="#[payload]"/>
+
+            <flow-ref
+                name="get-message-metadata-flow"
+                doc:name="Get Message Metadata"/>
+
+        </parallel-foreach>
+
+        <ee:transform doc:name="Normalize Messages">
             <ee:message>
-                <ee:set-payload><![CDATA[
-%dw 2.0
+                <ee:set-payload resource="dw/normalize-messages.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <ee:transform doc:name="Prepare Report Input">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    reportRequest: vars.reportRequest,
-    emails: payload default []
+    request: vars.reportRequest,
+    messages: payload,
+    collection: {
+        truncated: vars.collectionTruncated
+    }
 }
                 ]]></ee:set-payload>
             </ee:message>
-
         </ee:transform>
 
-        <!-- Build Final Report -->
         <ee:transform doc:name="Build Email Report">
-
             <ee:message>
                 <ee:set-payload resource="dw/build-email-report.dwl"/>
             </ee:message>
-
         </ee:transform>
 
         <logger
             level="INFO"
             doc:name="Report Generated"
-            message="Gmail report generated successfully."/>
+            message="#['Relatório gerado. Mensagens analisadas: ' ++ (payload.statistics.totalEmails as String) ++ '. correlationId=' ++ (vars.correlationId default correlationId)]"/>
+
+    </sub-flow>
+
+    <!--
+        Coleta recursiva de ids de mensagens, limitada por maxMessages e gmail.maxListPages.
+        Cada chamada busca uma página (no máximo o que falta para maxMessages) e só continua se houver nextPageToken.
+    -->
+    <sub-flow name="collect-message-ids-flow">
+
+        <choice doc:name="More Pages Needed?">
+            <when expression="#[(vars.pagesFetched == 0 or vars.pageToken != null) and sizeOf(vars.collectedIds) < vars.maxMessages and vars.pagesFetched < vars.maxPages]">
+
+                <set-variable
+                    variableName="pageSize"
+                    value="#[if ((vars.maxMessages - sizeOf(vars.collectedIds)) < vars.configuredPageSize) (vars.maxMessages - sizeOf(vars.collectedIds)) else vars.configuredPageSize]"/>
+
+                <flow-ref
+                    name="get-message-page-flow"
+                    doc:name="Get Message Page"/>
+
+                <set-variable
+                    variableName="collectedIds"
+                    value="#[(vars.collectedIds ++ ((payload.messages default []) map ((message) -> message.id))) filter ((id, index) -> index < vars.maxMessages)]"/>
+
+                <set-variable
+                    variableName="pageToken"
+                    value="#[payload.nextPageToken]"/>
+
+                <set-variable
+                    variableName="pagesFetched"
+                    value="#[vars.pagesFetched + 1]"/>
+
+                <flow-ref
+                    name="collect-message-ids-flow"
+                    doc:name="Next Page"/>
+
+            </when>
+        </choice>
+
+    </sub-flow>
+
+    <!-- Job diário: últimas 24 h (ontem até hoje, fuso report.timezone) -->
+    <flow name="daily-email-report-flow">
+
+        <scheduler doc:name="Daily Report Schedule">
+            <scheduling-strategy>
+                <cron expression="${report.daily.cron}" timeZone="${report.timezone}"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <set-variable
+            variableName="correlationId"
+            value="#[uuid()]"/>
+
+        <ee:transform doc:name="Daily Report Request">
+            <ee:message>
+                <ee:set-payload resource="dw/build-daily-report-request.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <flow-ref
+            name="generate-email-report-flow"
+            doc:name="Generate Daily Report"/>
+
+        <set-variable
+            variableName="dailyReport"
+            value="#[payload]"/>
+
+        <file:write
+            path="#[p('report.outputDir') ++ '/daily-report-' ++ vars.dailyReport.period.endDate ++ '.json']"
+            createParentDirectories="true"
+            doc:name="Save Daily Report">
+            <file:content><![CDATA[#[write(vars.dailyReport, 'application/json')]]]></file:content>
+        </file:write>
+
+        <set-payload value="#[vars.dailyReport]"/>
+
+        <ee:transform doc:name="Notification Text">
+            <ee:message>
+                <ee:set-payload resource="dw/build-report-notification.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable
+            variableName="notificationTitle"
+            value="Relatorio Gmail gerado"/>
+
+        <set-variable
+            variableName="notificationMessage"
+            value="#[payload]"/>
+
+        <flow-ref
+            name="send-phone-notification-flow"
+            doc:name="Notify Phone"/>
+
+        <error-handler>
+            <on-error-continue
+                type="ANY"
+                doc:name="Daily Report Failed">
+
+                <logger
+                    level="ERROR"
+                    message="#['Falha no relatório diário. correlationId=' ++ vars.correlationId ++ ' erro=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier)]"/>
+
+                <set-variable
+                    variableName="notificationTitle"
+                    value="Falha no relatorio Gmail"/>
+
+                <set-variable
+                    variableName="notificationMessage"
+                    value="#['Nao foi possivel gerar o relatorio diario (' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier) ++ '). Consulte os logs.']"/>
+
+                <flow-ref
+                    name="send-phone-notification-flow"
+                    doc:name="Notify Failure"/>
+
+            </on-error-continue>
+        </error-handler>
 
     </flow>
 

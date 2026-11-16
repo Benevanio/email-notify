@@ -1,0 +1,799 @@
+#%RAML 1.0
+title: Bene Notify API
+version: 1.0.0
+baseUri: https://api.example.com/api/v1
+mediaType: application/json
+description: |
+  API do Bene Notify: monitora e-mails do Gmail, classifica, aplica regras e envia
+  notificações pelo WhatsApp Business Cloud API (oficial da Meta).
+  Os exemplos usam domínios e identificadores fictícios.
+
+securitySchemes:
+  adminToken:
+    type: Pass Through
+    description: Sessão administrativa válida, enviada no header Authorization: Bearer <token>.
+    describedBy:
+      headers:
+        Authorization:
+          type: string
+
+traits:
+  paged:
+    queryParameters:
+      limit:
+        type: integer
+        required: false
+        minimum: 1
+        maximum: 100
+        default: 20
+      cursor:
+        type: string
+        required: false
+  errorResponses:
+    responses:
+      400:
+        body:
+          application/json:
+            type: ErrorResponse
+      401:
+        body:
+          application/json:
+            type: ErrorResponse
+      404:
+        body:
+          application/json:
+            type: ErrorResponse
+      429:
+        body:
+          application/json:
+            type: ErrorResponse
+      500:
+        body:
+          application/json:
+            type: ErrorResponse
+
+types:
+  ErrorResponse:
+    type: object
+    description: Formato padrão de erro. Nunca contém tokens, segredos, headers ou stack trace.
+    properties:
+      code:
+        type: string
+        example: RESOURCE_NOT_FOUND
+      message:
+        type: string
+        example: O recurso solicitado não foi encontrado.
+      correlationId:
+        type: string
+        example: 5f0c1f3e-2a7b-4d7e-9b1a-0e5d7c9f1a22
+      details:
+        type: array
+        required: false
+        items:
+          type: object
+          properties:
+            field: string
+            issue: string
+
+  Page:
+    type: object
+    properties:
+      nextCursor:
+        type: string
+        required: false
+      limit: integer
+
+  EmailCategory:
+    type: string
+    enum: [URGENTE, IMPORTANTE, ACAO_NECESSARIA, INFORMATIVO, BAIXA_PRIORIDADE]
+
+  UrgencyLevel:
+    type: string
+    enum: [LOW, MEDIUM, HIGH, CRITICAL]
+
+  Email:
+    type: object
+    properties:
+      id: string
+      gmailMessageId: string
+      gmailThreadId: string
+      senderEmail:
+        type: string
+        example: contato@exemplo.com
+      senderDomain:
+        type: string
+        example: exemplo.com
+      senderName: string
+      subject: string
+      snippet:
+        type: string
+        description: Trecho curto. Corpo completo não é armazenado.
+      receivedAt:
+        type: datetime-only
+        format: rfc3339
+        example: "2026-11-15T13:04:22Z"
+      unread: boolean
+      labelIds:
+        type: array
+        items: string
+      classification:
+        type: Classification
+        required: false
+
+  Classification:
+    type: object
+    description: Resultado heurístico e explicável. Não confirma uma tarefa.
+    properties:
+      category: EmailCategory
+      urgencyLevel: UrgencyLevel
+      requiresAction:
+        type: boolean
+        description: Indica que o e-mail parece pedir ação. Não é uma tarefa confirmada.
+      possibleAction:
+        type: string
+        required: false
+      classificationReason:
+        type: string
+        example: Assunto contém "vencimento" e "urgente".
+      classifierVersion: string
+
+  EmailPage:
+    type: object
+    properties:
+      items:
+        type: array
+        items: Email
+      nextCursor:
+        type: string
+        required: false
+
+  GmailStatus:
+    type: object
+    properties:
+      connected: boolean
+      account:
+        type: string
+        required: false
+        example: conta@exemplo.com
+      grantedScope: string
+      watchExpiration:
+        type: datetime-only
+        required: false
+      lastSyncAt:
+        type: datetime-only
+        required: false
+      lastSyncStatus:
+        type: string
+        enum: [SUCCEEDED, FAILED]
+        required: false
+
+  AuthorizationUrl:
+    type: object
+    properties:
+      authorizationUrl: string
+
+  Label:
+    type: object
+    properties:
+      id: string
+      name: string
+      type:
+        type: string
+        enum: [system, user]
+      messagesTotal: integer
+      messagesUnread: integer
+
+  ReportRequest:
+    type: object
+    properties:
+      startDate:
+        type: string
+        pattern: ^\d{4}-\d{2}-\d{2}$
+      endDate:
+        type: string
+        pattern: ^\d{4}-\d{2}-\d{2}$
+      groupBy:
+        type: string
+        enum: [day, week, month]
+        default: day
+      includeRead:
+        type: boolean
+        default: true
+      includeUnread:
+        type: boolean
+        default: true
+      maxEmails:
+        type: integer
+        minimum: 1
+        maximum: 500
+        required: false
+
+  Report:
+    type: object
+    properties:
+      period:
+        type: object
+        properties:
+          startDate: string
+          endDate: string
+      statistics:
+        type: object
+        properties:
+          totalEmails: integer
+          unreadEmails: integer
+          uniqueSenders: integer
+          pendingActions: integer
+          importantEmails: integer
+          byCategory:
+            type: object
+      frequentSenders:
+        type: array
+        items:
+          type: object
+          properties:
+            sender: string
+            totalEmails: integer
+      volume:
+        type: array
+        items:
+          type: object
+          properties:
+            period: string
+            totalEmails: integer
+            unreadEmails: integer
+      executiveSummary: string
+
+  Summary:
+    type: object
+    properties:
+      emailsMonitored: integer
+      receivedToday: integer
+      important: integer
+      urgent: integer
+      notificationsSent: integer
+      notificationsPending: integer
+      notificationsFailed: integer
+      lastSyncAt:
+        type: datetime-only
+        required: false
+
+  Notification:
+    type: object
+    properties:
+      id: string
+      emailId: string
+      channel:
+        type: string
+        enum: [WHATSAPP]
+      status:
+        type: string
+        enum: [PENDING, SENT, DELIVERED, READ, FAILED, SKIPPED]
+      templateName: string
+      providerMessageId: string
+      lastErrorCode:
+        type: string
+        required: false
+      createdAt: datetime-only
+      sentAt:
+        type: datetime-only
+        required: false
+
+  Rule:
+    type: object
+    properties:
+      id: string
+      name:
+        type: string
+        maxLength: 120
+      ruleType:
+        type: string
+        enum: [PRIORITY_SENDER, PRIORITY_DOMAIN, KEYWORD, SUBJECT, IGNORED_SENDER, IGNORED_KEYWORD]
+      matchValue:
+        type: string
+        maxLength: 255
+      minUrgency:
+        type: UrgencyLevel
+        required: false
+      enabled:
+        type: boolean
+        default: true
+
+  RuleInput:
+    type: object
+    properties:
+      name:
+        type: string
+        maxLength: 120
+      ruleType:
+        type: string
+        enum: [PRIORITY_SENDER, PRIORITY_DOMAIN, KEYWORD, SUBJECT, IGNORED_SENDER, IGNORED_KEYWORD]
+      matchValue:
+        type: string
+        maxLength: 255
+      minUrgency:
+        type: UrgencyLevel
+        required: false
+      enabled:
+        type: boolean
+        default: true
+
+  Health:
+    type: object
+    properties:
+      status:
+        type: string
+        enum: [UP]
+      version: string
+      environment: string
+
+  SystemStatus:
+    type: object
+    properties:
+      api: string
+      database:
+        type: string
+        enum: [UP, DOWN]
+      gmail:
+        type: string
+        enum: [CONNECTED, DISCONNECTED, ERROR]
+      whatsapp:
+        type: string
+        enum: [CONFIGURED, NOT_CONFIGURED, ERROR]
+
+  WebhookAck:
+    type: object
+    properties:
+      accepted: boolean
+
+/health:
+  get:
+    securedBy: [null]
+    description: Disponibilidade da API.
+    responses:
+      200:
+        body:
+          application/json:
+            type: Health
+
+/status:
+  get:
+    securedBy: [adminToken]
+    description: Estado das integrações e do banco.
+    responses:
+      200:
+        body:
+          application/json:
+            type: SystemStatus
+      401:
+        body:
+          application/json:
+            type: ErrorResponse
+
+/gmail:
+  /status:
+    get:
+      securedBy: [adminToken]
+      description: Estado da conexão Gmail e do monitoramento.
+      responses:
+        200:
+          body:
+            application/json:
+              type: GmailStatus
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+  /authorize:
+    get:
+      securedBy: [adminToken]
+      description: Gera a URL de autorização OAuth 2.0 (state aleatório, escopo gmail.readonly).
+      responses:
+        200:
+          body:
+            application/json:
+              type: AuthorizationUrl
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+  /callback:
+    get:
+      securedBy: [null]
+      description: Redirect URI do OAuth. Valida o state, troca o code e armazena os tokens cifrados.
+      queryParameters:
+        code:
+          type: string
+          required: false
+        state:
+          type: string
+          required: false
+        error:
+          type: string
+          required: false
+      responses:
+        302:
+          description: Redireciona para o painel administrativo.
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+  /disconnect:
+    post:
+      securedBy: [adminToken]
+      description: Revoga a conexão Gmail, remove os tokens e cancela o monitoramento.
+      responses:
+        200:
+          body:
+            application/json:
+              type: GmailStatus
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+  /sync:
+    post:
+      securedBy: [adminToken]
+      description: Dispara sincronização manual pelo historyId, sem duplicar mensagens já processadas.
+      responses:
+        202:
+          description: Sincronização enfileirada.
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        429:
+          body:
+            application/json:
+              type: ErrorResponse
+  /emails:
+    get:
+      securedBy: [adminToken]
+      description: Lista e-mails monitorados, com classificação.
+      queryParameters:
+        limit:
+          type: integer
+          required: false
+          minimum: 1
+          maximum: 100
+          default: 20
+        cursor:
+          type: string
+          required: false
+        category:
+          type: EmailCategory
+          required: false
+        urgencyLevel:
+          type: UrgencyLevel
+          required: false
+        sender:
+          type: string
+          required: false
+        from:
+          type: date-only
+          required: false
+        to:
+          type: date-only
+          required: false
+      responses:
+        200:
+          body:
+            application/json:
+              type: EmailPage
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+    /{id}:
+      uriParameters:
+        id:
+          type: string
+      get:
+        securedBy: [adminToken]
+        description: Detalhe de um e-mail monitorado (sem corpo).
+        responses:
+          200:
+            body:
+              application/json:
+                type: Email
+          401:
+            body:
+              application/json:
+                type: ErrorResponse
+          404:
+            body:
+              application/json:
+                type: ErrorResponse
+    /unread:
+      get:
+        securedBy: [adminToken]
+        description: E-mails não lidos monitorados.
+        queryParameters:
+          limit:
+            type: integer
+            required: false
+            minimum: 1
+            maximum: 100
+            default: 20
+          cursor:
+            type: string
+            required: false
+        responses:
+          200:
+            body:
+              application/json:
+                type: EmailPage
+          401:
+            body:
+              application/json:
+                type: ErrorResponse
+  /labels:
+    get:
+      securedBy: [adminToken]
+      description: Labels da conta (somente leitura).
+      responses:
+        200:
+          body:
+            application/json:
+              type: Label[]
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+
+/reports:
+  /emails:
+    post:
+      securedBy: [adminToken]
+      description: Gera relatório consolidado de e-mails em um intervalo de datas.
+      body:
+        application/json:
+          type: ReportRequest
+      responses:
+        200:
+          body:
+            application/json:
+              type: Report
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+  /summary:
+    get:
+      securedBy: [adminToken]
+      description: Indicadores do dashboard.
+      responses:
+        200:
+          body:
+            application/json:
+              type: Summary
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+
+/notifications:
+  get:
+    securedBy: [adminToken]
+    description: Histórico de notificações.
+    queryParameters:
+      limit:
+        type: integer
+        required: false
+        minimum: 1
+        maximum: 100
+        default: 20
+      cursor:
+        type: string
+        required: false
+      status:
+        type: string
+        enum: [PENDING, SENT, DELIVERED, READ, FAILED, SKIPPED]
+        required: false
+    responses:
+      200:
+        body:
+          application/json:
+            type: Notification[]
+      401:
+        body:
+          application/json:
+            type: ErrorResponse
+  /{id}:
+    uriParameters:
+      id:
+        type: string
+    get:
+      securedBy: [adminToken]
+      description: Detalhe de uma notificação, com status e tentativas.
+      responses:
+        200:
+          body:
+            application/json:
+              type: Notification
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        404:
+          body:
+            application/json:
+              type: ErrorResponse
+    /retry:
+      post:
+        securedBy: [adminToken]
+        description: Reenvia uma notificação em FAILED. Usa template aprovado.
+        responses:
+          202:
+            description: Reenvio enfileirado.
+          401:
+            body:
+              application/json:
+                type: ErrorResponse
+          404:
+            body:
+              application/json:
+                type: ErrorResponse
+          409:
+            body:
+              application/json:
+                type: ErrorResponse
+
+/rules:
+  get:
+    securedBy: [adminToken]
+    description: Lista regras de notificação.
+    responses:
+      200:
+        body:
+          application/json:
+            type: Rule[]
+      401:
+        body:
+          application/json:
+            type: ErrorResponse
+  post:
+    securedBy: [adminToken]
+    description: Cria uma regra.
+    body:
+      application/json:
+        type: RuleInput
+    responses:
+      201:
+        body:
+          application/json:
+            type: Rule
+      400:
+        body:
+          application/json:
+            type: ErrorResponse
+      401:
+        body:
+          application/json:
+            type: ErrorResponse
+      409:
+        body:
+          application/json:
+            type: ErrorResponse
+  /{id}:
+    uriParameters:
+      id:
+        type: string
+    get:
+      securedBy: [adminToken]
+      responses:
+        200:
+          body:
+            application/json:
+              type: Rule
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        404:
+          body:
+            application/json:
+              type: ErrorResponse
+    put:
+      securedBy: [adminToken]
+      body:
+        application/json:
+          type: RuleInput
+      responses:
+        200:
+          body:
+            application/json:
+              type: Rule
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        404:
+          body:
+            application/json:
+              type: ErrorResponse
+    delete:
+      securedBy: [adminToken]
+      responses:
+        204:
+          description: Regra removida.
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        404:
+          body:
+            application/json:
+              type: ErrorResponse
+
+/webhooks:
+  /google-pubsub:
+    post:
+      securedBy: [null]
+      description: Notificação do Gmail via Pub/Sub. Exige Bearer OIDC do Google, validado no servidor (emissor, audiência e e-mail da service account). Responde 2xx rápido e processa de forma assíncrona.
+      headers:
+        Authorization:
+          type: string
+          required: true
+      responses:
+        204:
+          description: Evento aceito.
+        401:
+          body:
+            application/json:
+              type: ErrorResponse
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+  /whatsapp:
+    get:
+      securedBy: [null]
+      description: Verificação do webhook pela Meta (hub.mode, hub.verify_token, hub.challenge).
+      queryParameters:
+        hub.mode:
+          type: string
+          required: true
+          enum: [subscribe]
+        hub.verify_token:
+          type: string
+          required: true
+        hub.challenge:
+          type: string
+          required: true
+      responses:
+        200:
+          body:
+            text/plain:
+              type: string
+        403:
+          body:
+            application/json:
+              type: ErrorResponse
+    post:
+      securedBy: [null]
+      description: Atualizações de status das mensagens (sent, delivered, read, failed). Valida X-Hub-Signature-256 com o app secret.
+      headers:
+        X-Hub-Signature-256:
+          type: string
+          required: true
+      responses:
+        200:
+          body:
+            application/json:
+              type: WebhookAck
+        401:
+          body:
+            application/json:
+              type: ErrorResponse

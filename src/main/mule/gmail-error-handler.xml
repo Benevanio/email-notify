@@ -8,165 +8,64 @@
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
 
-    
+    <!--
+        Tratamento global de erros da API pública.
+        Mapeia o tipo de erro (namespace:identifier) para status HTTP e código estável.
+        Erros do Gmail chegam como GMAIL:* (já convertidos em gmail-connector.xml), nunca como HTTP:404 cru.
+        Resposta: { code, message, correlationId, details }. Details só em erros de validação.
+        Nunca inclui tokens, headers, corpos de e-mail, payloads ou stack traces.
+    -->
     <error-handler name="global-error-handler">
 
         <on-error-propagate
-            type="HTTP:UNAUTHORIZED"
-            logException="true"
-            doc:name="Authentication Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="401"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'UNAUTHORIZED',
-                    message: 'Authentication with Gmail is required.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Permission errors -->
-        <on-error-propagate
-            type="HTTP:FORBIDDEN"
-            logException="true"
-            doc:name="Permission Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="403"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'FORBIDDEN',
-                    message: 'Insufficient permissions to access Gmail resources.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Resource not found -->
-        <on-error-propagate
-            type="HTTP:NOT_FOUND"
-            logException="true"
-            doc:name="Resource Not Found">
-
-            <set-variable
-                variableName="httpStatus"
-                value="404"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'NOT_FOUND',
-                    message: 'Requested resource was not found.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Rate limit -->
-        <on-error-propagate
-            type="HTTP:TOO_MANY_REQUESTS"
-            logException="true"
-            doc:name="Rate Limit Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="429"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'RATE_LIMIT_EXCEEDED',
-                    message: 'Gmail API request limit exceeded. Please try again later.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Timeout -->
-        <on-error-propagate
-            type="HTTP:TIMEOUT"
-            logException="true"
-            doc:name="Timeout Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="504"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'GATEWAY_TIMEOUT',
-                    message: 'Gmail API request timed out.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Connectivity -->
-        <on-error-propagate
-            type="HTTP:CONNECTIVITY"
-            logException="true"
-            doc:name="Connectivity Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="503"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'SERVICE_UNAVAILABLE',
-                    message: 'Unable to connect to Gmail API.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Validation -->
-        <on-error-propagate
-            type="VALIDATION:*"
-            logException="false"
-            doc:name="Validation Error">
-
-            <set-variable
-                variableName="httpStatus"
-                value="400"/>
-
-            <set-payload
-                mimeType="application/json"
-                value="#[{
-                    code: 'VALIDATION_ERROR',
-                    message: 'Request validation failed.',
-                    correlationId: vars.correlationId default correlationId
-                }]"/>
-
-        </on-error-propagate>
-
-        <!-- Unexpected errors -->
-        <on-error-propagate
             type="ANY"
-            logException="true"
-            doc:name="Internal Server Error">
+            logException="false"
+            doc:name="Public Error Response">
+
+            <set-variable
+                variableName="errorSpec"
+                value="#[({
+                    'APIKIT:BAD_REQUEST': {status: 400, code: 'VALIDATION_ERROR', message: 'A requisição não atende ao contrato da API.', details: true},
+                    'APIKIT:NOT_FOUND': {status: 404, code: 'ENDPOINT_NOT_FOUND', message: 'Endpoint não encontrado.', details: false},
+                    'APIKIT:METHOD_NOT_ALLOWED': {status: 405, code: 'METHOD_NOT_ALLOWED', message: 'Método HTTP não permitido para este endpoint.', details: false},
+                    'APIKIT:NOT_ACCEPTABLE': {status: 406, code: 'NOT_ACCEPTABLE', message: 'Formato de resposta não suportado.', details: false},
+                    'APIKIT:UNSUPPORTED_MEDIA_TYPE': {status: 415, code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Tipo de conteúdo não suportado. Use application/json.', details: false},
+                    'VALIDATION:INVALID_INPUT': {status: 400, code: 'VALIDATION_ERROR', message: 'Parâmetros inválidos.', details: true},
+                    'AUTH:NOT_AUTHORIZED': {status: 401, code: 'AUTHORIZATION_REQUIRED', message: 'Gmail não autorizado. Acesse /api/auth/google para autorizar.', details: false},
+                    'AUTH:REFRESH_TOKEN_INVALID': {status: 401, code: 'REFRESH_TOKEN_INVALID', message: 'A autorização do Gmail foi revogada ou expirou. Acesse /api/auth/google para autorizar novamente.', details: false},
+                    'AUTH:AUTHORIZATION_DENIED': {status: 403, code: 'AUTHORIZATION_DENIED', message: 'A autorização foi negada.', details: false},
+                    'AUTH:INVALID_STATE': {status: 400, code: 'INVALID_OAUTH_STATE', message: 'State OAuth inválido ou expirado.', details: false},
+                    'AUTH:TOKEN_EXCHANGE_FAILED': {status: 401, code: 'TOKEN_EXCHANGE_FAILED', message: 'Não foi possível concluir a autorização com o Google.', details: false},
+                    'GMAIL:AUTHENTICATION': {status: 401, code: 'GMAIL_AUTHENTICATION_FAILED', message: 'O Gmail não aceitou a autorização. Acesse /api/auth/google para autorizar novamente.', details: false},
+                    'GMAIL:PERMISSION': {status: 403, code: 'GMAIL_PERMISSION_DENIED', message: 'Sem permissão para acessar este recurso no Gmail.', details: false},
+                    'GMAIL:NOT_FOUND': {status: 404, code: 'RESOURCE_NOT_FOUND', message: 'O recurso solicitado não foi encontrado.', details: false},
+                    'GMAIL:BAD_REQUEST': {status: 400, code: 'GMAIL_BAD_REQUEST', message: 'O Gmail rejeitou a consulta. Verifique o filtro de pesquisa.', details: false},
+                    'GMAIL:RATE_LIMITED': {status: 429, code: 'RATE_LIMIT_EXCEEDED', message: 'Limite de requisições ao Gmail atingido. Tente novamente mais tarde.', details: false},
+                    'GMAIL:TIMEOUT': {status: 504, code: 'GMAIL_TIMEOUT', message: 'Tempo limite ao consultar o Gmail.', details: false},
+                    'GMAIL:CONNECTIVITY': {status: 503, code: 'GMAIL_CONNECTIVITY_ERROR', message: 'Não foi possível conectar ao Gmail.', details: false},
+                    'GMAIL:UNAVAILABLE': {status: 503, code: 'GMAIL_UNAVAILABLE', message: 'O Gmail está indisponível no momento.', details: false},
+                    'HTTP:TIMEOUT': {status: 504, code: 'UPSTREAM_TIMEOUT', message: 'Tempo limite em um serviço externo.', details: false},
+                    'HTTP:CONNECTIVITY': {status: 503, code: 'UPSTREAM_UNAVAILABLE', message: 'Serviço externo indisponível.', details: false}
+                })[error.errorType.namespace ++ ':' ++ error.errorType.identifier]
+                    default {status: 500, code: 'INTERNAL_ERROR', message: 'Ocorreu um erro inesperado. Consulte o correlationId nos logs.', details: false}]"/>
 
             <set-variable
                 variableName="httpStatus"
-                value="500"/>
+                value="#[vars.errorSpec.status]"/>
 
             <set-payload
                 mimeType="application/json"
                 value="#[{
-                    code: 'INTERNAL_SERVER_ERROR',
-                    message: 'An unexpected error occurred.',
-                    correlationId: vars.correlationId default correlationId
+                    code: vars.errorSpec.code,
+                    message: vars.errorSpec.message,
+                    correlationId: vars.correlationId default correlationId,
+                    details: if (vars.errorSpec.details) (error.description default null) else null
                 }]"/>
+
+            <logger
+                level="WARN"
+                doc:name="Log Public Error"
+                message="#['Erro na API: ' ++ vars.errorSpec.code ++ ' (HTTP ' ++ (vars.errorSpec.status as String) ++ ') tipo=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier) ++ ' correlationId=' ++ (vars.correlationId default correlationId)]"/>
 
         </on-error-propagate>
 

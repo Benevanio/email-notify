@@ -1,5 +1,182 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd"></mule>
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!--
+        Chamada genérica à Gmail REST API (GET).
+        Entrada : vars.gmailPath (String), vars.gmailQueryParams (Object; valores nulos são removidos)
+        Saída   : payload = JSON da Gmail API
+        Erros   : GMAIL:AUTHENTICATION | PERMISSION | NOT_FOUND | BAD_REQUEST | RATE_LIMITED | TIMEOUT | CONNECTIVITY | UNAVAILABLE
+
+        - 429, 5xx, timeout e conectividade: novas tentativas (gmail.retry.*).
+        - 401: renova o access token e tenta de novo.
+        - 400, 403, 404: falham na hora, sem retry.
+        Erros do Gmail nunca são devolvidos com o tipo HTTP:* ao cliente: são convertidos para GMAIL:*.
+    -->
+    <sub-flow name="call-gmail-api-flow">
+
+        <flow-ref
+            name="ensure-google-access-token-flow"
+            doc:name="Ensure Google Access Token"/>
+
+        <set-variable
+            variableName="gmailFailure"
+            value="#[null]"
+            doc:name="Reset Gmail Failure"/>
+
+        <try doc:name="Gmail Request With Retry">
+
+            <until-successful
+                maxRetries="${gmail.retry.maxRetries}"
+                millisBetweenRetries="${gmail.retry.intervalMs}"
+                doc:name="Retry Gmail Request">
+
+                <set-variable
+                    variableName="gmailFailure"
+                    value="#[null]"/>
+
+                <try>
+
+                    <http:request
+                        config-ref="Gmail_HTTP_Request_Config"
+                        method="GET"
+                        path="#[vars.gmailPath]"
+                        doc:name="Gmail GET">
+
+                        <http:headers><![CDATA[#[{
+                            Authorization: 'Bearer ' ++ vars.googleAccessToken,
+                            Accept: 'application/json'
+                        }]]]></http:headers>
+
+                        <http:query-params><![CDATA[#[(vars.gmailQueryParams default {}) filterObject ((value) -> value != null)]]]></http:query-params>
+
+                    </http:request>
+
+                    <error-handler>
+
+                        <on-error-continue
+                            type="HTTP:NOT_FOUND, HTTP:FORBIDDEN, HTTP:BAD_REQUEST"
+                            doc:name="Non-retryable Gmail Error">
+                            <set-variable
+                                variableName="gmailFailure"
+                                value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+                            <set-payload value="#[null]"/>
+                        </on-error-continue>
+
+                        <on-error-propagate
+                            type="HTTP:UNAUTHORIZED"
+                            doc:name="Unauthorized: Refresh And Retry">
+                            <set-variable
+                                variableName="gmailFailure"
+                                value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+                            <flow-ref
+                                name="refresh-google-access-token-flow"
+                                doc:name="Refresh Access Token"/>
+                        </on-error-propagate>
+
+                        <on-error-propagate
+                            type="HTTP:TOO_MANY_REQUESTS, HTTP:INTERNAL_SERVER_ERROR, HTTP:SERVICE_UNAVAILABLE, HTTP:TIMEOUT, HTTP:CONNECTIVITY"
+                            doc:name="Retryable Gmail Error">
+                            <set-variable
+                                variableName="gmailFailure"
+                                value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+                        </on-error-propagate>
+
+                    </error-handler>
+
+                </try>
+
+            </until-successful>
+
+            <error-handler>
+                <!-- Tentativas esgotadas: vars.gmailFailure guarda o último erro do Gmail. -->
+                <on-error-continue
+                    type="MULE:RETRY_EXHAUSTED"
+                    doc:name="Retries Exhausted"/>
+            </error-handler>
+
+        </try>
+
+        <choice doc:name="Map Gmail Failure">
+            <when expression="#[vars.gmailFailure != null]">
+                <choice>
+                    <when expression="#[vars.gmailFailure == 'HTTP:NOT_FOUND']">
+                        <raise-error type="GMAIL:NOT_FOUND" description="Recurso não encontrado no Gmail."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:FORBIDDEN']">
+                        <raise-error type="GMAIL:PERMISSION" description="O Gmail negou o acesso ao recurso."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:BAD_REQUEST']">
+                        <raise-error type="GMAIL:BAD_REQUEST" description="O Gmail rejeitou a requisição."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:UNAUTHORIZED']">
+                        <raise-error type="GMAIL:AUTHENTICATION" description="O Gmail não aceitou a autorização, mesmo após renovar o token."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:TOO_MANY_REQUESTS']">
+                        <raise-error type="GMAIL:RATE_LIMITED" description="Limite de requisições do Gmail atingido."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:TIMEOUT']">
+                        <raise-error type="GMAIL:TIMEOUT" description="Tempo limite na chamada ao Gmail."/>
+                    </when>
+                    <when expression="#[vars.gmailFailure == 'HTTP:CONNECTIVITY']">
+                        <raise-error type="GMAIL:CONNECTIVITY" description="Não foi possível conectar ao Gmail."/>
+                    </when>
+                    <otherwise>
+                        <raise-error type="GMAIL:UNAVAILABLE" description="O Gmail está indisponível no momento."/>
+                    </otherwise>
+                </choice>
+            </when>
+        </choice>
+
+    </sub-flow>
+
+    <!-- Monta as chamadas genéricas usadas pelos fluxos de e-mail, thread e label -->
+
+    <sub-flow name="get-message-page-flow">
+        <set-variable variableName="gmailPath" value="/messages"/>
+        <set-variable
+            variableName="gmailQueryParams"
+            value="#[{q: vars.gmailQuery, maxResults: vars.pageSize, pageToken: vars.pageToken}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="List Message Page"/>
+    </sub-flow>
+
+    <sub-flow name="get-message-metadata-flow">
+        <set-variable variableName="gmailPath" value="#['/messages/' ++ vars.messageId]"/>
+        <set-variable variableName="gmailQueryParams" value="#[{format: 'metadata'}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="Get Message Metadata"/>
+    </sub-flow>
+
+    <sub-flow name="get-message-full-flow">
+        <set-variable variableName="gmailPath" value="#['/messages/' ++ vars.messageId]"/>
+        <set-variable variableName="gmailQueryParams" value="#[{format: 'full'}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="Get Message Full"/>
+    </sub-flow>
+
+    <sub-flow name="get-thread-metadata-flow">
+        <set-variable variableName="gmailPath" value="#['/threads/' ++ vars.threadId]"/>
+        <set-variable variableName="gmailQueryParams" value="#[{format: 'metadata'}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="Get Thread Metadata"/>
+    </sub-flow>
+
+    <sub-flow name="list-label-ids-flow">
+        <set-variable variableName="gmailPath" value="/labels"/>
+        <set-variable variableName="gmailQueryParams" value="#[{}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="List Labels"/>
+    </sub-flow>
+
+    <sub-flow name="get-label-flow">
+        <set-variable variableName="gmailPath" value="#['/labels/' ++ vars.labelId]"/>
+        <set-variable variableName="gmailQueryParams" value="#[{}]"/>
+        <flow-ref name="call-gmail-api-flow" doc:name="Get Label"/>
+    </sub-flow>
+
+</mule>

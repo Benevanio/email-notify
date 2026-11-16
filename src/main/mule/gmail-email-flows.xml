@@ -1,158 +1,146 @@
 <?xml version="1.0" encoding="UTF-8"?>
+
 <mule
-    xmlns:http="http://www.mulesoft.org/schema/mule/http"
-    xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
     xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="
-http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
-http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd
-        http://www.mulesoft.org/schema/mule/http
-        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/ee/core
         http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-    <!-- Listagem de e-mails -->
-    <sub-flow name="get-gmail-messages-flow">
+    <!--
+        Fluxos de e-mail, thread e label. Todos somente leitura.
+        Entradas (vars): gmailQuery, pageSize, pageToken | messageId | threadId
+    -->
+
+    <!-- Listagem com metadados: /emails, /emails/unread, /emails/search -->
+    <sub-flow name="list-emails-flow">
 
         <flow-ref
-            name="ensure-google-access-token-flow"
-            doc:name="Ensure Google Access Token"/>
-
-        <http:request
-            config-ref="Gmail_HTTP_Request_Config"
-            method="GET"
-            path="/messages"
-            doc:name="List Gmail Messages">
-
-            <http:headers><![CDATA[#[{
-                Authorization: "Bearer " ++ vars.googleAccessToken
-            }]]]></http:headers>
-
-            <http:query-params><![CDATA[#[{
-                maxResults: vars.maxResults default 20,
-                q: vars.gmailQuery default "in:inbox"
-            }]]]></http:query-params>
-
-        </http:request>
-
-    </sub-flow>
-
-    <!-- Consulta de um e-mail individual -->
-    <sub-flow name="get-gmail-message-flow">
-
-        <flow-ref
-            name="ensure-google-access-token-flow"
-            doc:name="Ensure Google Access Token"/>
-
-        <http:request
-            config-ref="Gmail_HTTP_Request_Config"
-            method="GET"
-            path="#['/messages/' ++ vars.emailId]"
-            doc:name="Get Gmail Message">
-
-            <http:headers><![CDATA[#[{
-                Authorization: "Bearer " ++ vars.googleAccessToken
-            }]]]></http:headers>
-
-            <http:query-params><![CDATA[#[{
-                format: "full"
-            }]]]></http:query-params>
-
-        </http:request>
-
-    </sub-flow>
-
-    <!-- Consulta de uma conversa completa -->
-    <sub-flow name="get-gmail-thread-flow">
-
-        <flow-ref
-            name="ensure-google-access-token-flow"
-            doc:name="Ensure Google Access Token"/>
-
-        <http:request
-            config-ref="Gmail_HTTP_Request_Config"
-            method="GET"
-            path="#['/threads/' ++ vars.threadId]"
-            doc:name="Get Gmail Thread">
-
-            <http:headers><![CDATA[#[{
-                Authorization: "Bearer " ++ vars.googleAccessToken
-            }]]]></http:headers>
-
-            <http:query-params><![CDATA[#[{
-                format: "full"
-            }]]]></http:query-params>
-
-        </http:request>
-
-    </sub-flow>
-
-    <!-- Listagem de e-mails não lidos -->
-    <sub-flow name="get-unread-gmail-messages-flow">
+            name="get-message-page-flow"
+            doc:name="Get Message Page"/>
 
         <set-variable
-            variableName="gmailQuery"
-            value="is:unread"
-            doc:name="Set Unread Query"/>
-
-        <flow-ref
-            name="get-gmail-messages-flow"
-            doc:name="Get Unread Messages"/>
-
-    </sub-flow>
-
-    <!-- Busca de e-mails por critérios -->
-    <sub-flow name="search-gmail-messages-flow">
+            variableName="nextPageToken"
+            value="#[payload.nextPageToken]"/>
 
         <set-variable
-            variableName="gmailQuery"
-            value="#[
-                vars.searchQuery default ''
-            ]"
-            doc:name="Set Search Query"/>
+            variableName="resultSizeEstimate"
+            value="#[payload.resultSizeEstimate default 0]"/>
 
-        <flow-ref
-            name="get-gmail-messages-flow"
-            doc:name="Search Gmail Messages"/>
+        <set-variable
+            variableName="messageIds"
+            value="#[(payload.messages default []) map ((message) -> message.id)]"/>
 
-    </sub-flow>
+        <parallel-foreach
+            collection="#[vars.messageIds]"
+            maxConcurrency="${gmail.maxConcurrency}"
+            doc:name="Fetch Message Metadata">
 
-    <!-- Normalização dos dados de uma mensagem -->
-    <sub-flow name="normalize-gmail-message-flow">
+            <set-variable
+                variableName="messageId"
+                value="#[payload]"/>
 
-        <ee:transform doc:name="Normalize Gmail Message">
+            <flow-ref
+                name="get-message-metadata-flow"
+                doc:name="Get Message Metadata"/>
+
+        </parallel-foreach>
+
+        <ee:transform doc:name="Normalize Messages">
             <ee:message>
-                <ee:set-payload><![CDATA[
-%dw 2.0
+                <ee:set-payload resource="dw/normalize-messages.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <ee:transform doc:name="Email Page">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
-
-var message = payload
-var headers = message.payload.headers default []
-
-fun getHeader(headerName) =
-    (
-        headers filter ((header) ->
-            lower(header.name default "") == lower(headerName)
-        )
-    )[0].value default null
-
 ---
 {
-    id: message.id default null,
-    threadId: message.threadId default null,
-    from: getHeader("From") default "Unknown",
-    to: getHeader("To") default "",
-    cc: getHeader("Cc") default "",
-    subject: getHeader("Subject") default "(Sem assunto)",
-    date: getHeader("Date") default null,
-    snippet: message.snippet default "",
-    unread: (message.labelIds default []) contains "UNREAD",
-    labels: message.labelIds default [],
-    internalDate: message.internalDate default null
+    emails: payload,
+    nextPageToken: vars.nextPageToken,
+    resultSizeEstimate: vars.resultSizeEstimate
+}
+                ]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- Detalhe de uma mensagem: /emails/{id} -->
+    <sub-flow name="get-email-detail-flow">
+
+        <flow-ref
+            name="get-message-full-flow"
+            doc:name="Get Full Message"/>
+
+        <ee:transform doc:name="Email Detail">
+            <ee:message>
+                <ee:set-payload resource="dw/message-detail.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- Conversa completa: /threads/{id} -->
+    <sub-flow name="get-thread-flow">
+
+        <flow-ref
+            name="get-thread-metadata-flow"
+            doc:name="Get Thread"/>
+
+        <ee:transform doc:name="Thread Detail">
+            <ee:message>
+                <ee:set-payload resource="dw/thread-detail.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+    </sub-flow>
+
+    <!-- Labels com contadores: /labels -->
+    <sub-flow name="list-labels-flow">
+
+        <flow-ref
+            name="list-label-ids-flow"
+            doc:name="List Label Ids"/>
+
+        <set-variable
+            variableName="labelIds"
+            value="#[(payload.labels default []) map ((label) -> label.id)]"/>
+
+        <parallel-foreach
+            collection="#[vars.labelIds]"
+            maxConcurrency="${gmail.maxConcurrency}"
+            doc:name="Fetch Label Details">
+
+            <set-variable
+                variableName="labelId"
+                value="#[payload]"/>
+
+            <flow-ref
+                name="get-label-flow"
+                doc:name="Get Label"/>
+
+            <ee:transform doc:name="Label Summary">
+                <ee:message>
+                    <ee:set-payload resource="dw/label-summary.dwl"/>
+                </ee:message>
+            </ee:transform>
+
+        </parallel-foreach>
+
+        <ee:transform doc:name="Label List">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    labels: payload
 }
                 ]]></ee:set-payload>
             </ee:message>

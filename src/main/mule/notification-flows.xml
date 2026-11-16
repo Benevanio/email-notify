@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule
+    xmlns:http="http://www.mulesoft.org/schema/mule/http"
+    xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!--
+        Aviso no celular via ntfy (https://ntfy.sh): instale o app ntfy, assine o tópico NTFY_TOPIC.
+        Entrada (vars): notificationTitle (ASCII), notificationMessage (texto puro, sem conteúdo de e-mails).
+        Falhas aqui NÃO interrompem o relatório: viram apenas log.
+    -->
+    <sub-flow name="send-phone-notification-flow">
+
+        <try doc:name="Send Phone Notification">
+
+            <http:request
+                config-ref="Notification_HTTP_Request_Config"
+                method="POST"
+                path="#['/' ++ p('notification.ntfy.topic')]"
+                doc:name="ntfy Publish">
+                <http:headers><![CDATA[#[{
+                    Title: vars.notificationTitle,
+                    Tags: 'email'
+                }]]]></http:headers>
+                <http:body><![CDATA[#[vars.notificationMessage]]]></http:body>
+            </http:request>
+
+            <error-handler>
+                <on-error-continue
+                    type="ANY"
+                    doc:name="Notification Not Sent">
+                    <logger
+                        level="WARN"
+                        message="#['Notificacao no celular nao enviada. correlationId=' ++ (vars.correlationId default '') ++ ' erro=' ++ (error.errorType.namespace ++ ':' ++ error.errorType.identifier)]"/>
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+    </sub-flow>
+
+</mule>
